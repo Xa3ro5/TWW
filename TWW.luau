@@ -1,5 +1,4 @@
 -- TWW | SmugLibV2 | 2026-11-03
--- Edit src/TWW.luau, then run tools/build.py. UI and licensing belong to shared SmugLibV2.
 if game.PlaceId ~= 2317712696 then
     warn("[TWW] This script supports The Wild West main place only.")
     return
