@@ -1,28 +1,31 @@
+-- TWW | SmugLibV2 | 2026-11-03
+-- Edit src/TWW.luau, then run tools/build.py. UI and licensing belong to shared SmugLibV2.
+if game.PlaceId ~= 2317712696 then
+    warn("[TWW] This script supports The Wild West main place only.")
+    return
+end
 local environment = (type(getgenv) == "function" and getgenv()) or _G
+environment.TWWLoadGeneration = (tonumber(environment.TWWLoadGeneration) or 0) + 1
+local loadGeneration = environment.TWWLoadGeneration
 if environment.TWWESP and type(environment.TWWESP.Destroy) == "function" then
     pcall(function() environment.TWWESP:Destroy() end)
 end
-
--- ====== SMUGLIB V2 LOADER ======
-local SMUGLIB_URLS = {
-    "https://raw.githubusercontent.com/Xa3ro5/LifeIsRoblox/refs/heads/main/SmugLibCoreV2.lua",
-    "https://pastebin.com/raw/CkVW0eJZ"
-}
-local Library
-do
-    for _, url in ipairs(SMUGLIB_URLS) do
-        local ok, source = pcall(game.HttpGet, game, url, true)
-        if ok and type(source) == "string" and source ~= "" then
-            local compile = loadstring(source)
-            if compile then
-                local ran, lib = pcall(compile)
-                if ran and type(lib) == "table" then Library = lib break end
-            end
-        end
-    end
-    if not Library then warn("[TWW] Failed to load SmugLibV2") return end
+local SMUGLIB_URL = "https://raw.githubusercontent.com/Xa3ro5/LifeIsRoblox/refs/heads/main/SmugLibCoreV2.lua"
+local ok, Library = pcall(function()
+    local source = game:HttpGet(SMUGLIB_URL, true)
+    local factory, compileError = loadstring(source)
+    if not factory then error(compileError or "Failed to compile SmugLibV2", 0) end
+    -- SmugLibV2 owns its key form, verification, cache and cancellation.
+    return factory()
+end)
+if not ok then warn("[TWW] SmugLibV2: " .. tostring(Library)); return end
+if loadGeneration ~= environment.TWWLoadGeneration then return end
+if type(Library) ~= "table" or type(Library.CreateWindow) ~= "function" then
+    warn("[TWW] SmugLibV2 did not return a UI library.")
+    return
 end
-
+local run = (function()
+return function(Library, environment)
 -- ====== SERVICES ======
 local S = {
     Players = game:GetService("Players"),
@@ -84,6 +87,7 @@ local state = {
     debugPrints=false, currentConfig="Default", showFOVRing=false,
     chamsResetInProgress=false,
     suppressErrors=false,
+    showPlants=false,
 }
 
 local DEFAULT_STATE = {}
@@ -99,60 +103,13 @@ for k, v in pairs(state) do
     end
 end
 
--- ====== ERROR / WARN SUPPRESS HOOK ======
-do
-    local _origWarn  = warn
-    local _origPrint = print
-    local function looksLikeError(s)
-        if type(s) ~= "string" then return false end
-        local l = s:lower()
-        return l:find("error", 1, true) ~= nil
-            or l:find("failed", 1, true) ~= nil
-            or l:find("warn", 1, true) ~= nil
-            or l:find("traceback", 1, true) ~= nil
-            or l:find("attempt to", 1, true) ~= nil
-    end
-    local newWarn = function(...)
-        if state and state.suppressErrors then return end
-        return _origWarn(...)
-    end
-    local newPrint = function(...)
-        if state and state.suppressErrors then
-            local a = ...
-            if looksLikeError(a) then return end
-        end
-        return _origPrint(...)
-    end
-
-    local env = environment or _G
-
-    pcall(function()
-        if type(isreadonly) == "function" and isreadonly(env) then
-            if type(setreadonly) == "function" then setreadonly(env, false)
-            elseif type(makewritable) == "function" then makewritable(env) end
-        end
-    end)
-
-    pcall(function() rawset(env, "warn", newWarn) end)
-    pcall(function() rawset(env, "print", newPrint) end)
-    pcall(function() warn = newWarn end)
-    pcall(function() print = newPrint end)
-
-    pcall(function()
-        if type(coroutine) == "table" and type(coroutine.wrap) == "function" then
-            local _origWrap = coroutine.wrap
-            pcall(function()
-                coroutine.wrap = function(f)
-                    return _origWrap(function(...)
-                        local ok, err = pcall(f, ...)
-                        if not ok and not (state and state.suppressErrors) then
-                            _origWarn("[TWW] Coroutine error: "..tostring(err))
-                        end
-                    end)
-                end
-            end)
-        end
-    end)
+-- Suppression applies only to this script; never replace game globals or coroutine.wrap.
+local originalWarn, originalPrint = warn, print
+local function warn(...)
+    if not state.suppressErrors then originalWarn(...) end
+end
+local function print(...)
+    if not state.suppressErrors then originalPrint(...) end
 end
 
 local COLOR_PRESETS = {
@@ -183,10 +140,26 @@ local PLAYER_BODY_GROUPS = {
 local uiHandles = { checkboxes={}, dropdowns={}, sliders={}, textboxes={}, checklists={} }
 
 local ESP, CHAR, COMBAT, HOOKS, AMMO, FB, CFG, INV, Physics, Water = {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+local Adapter = { plants={}, npcByRig=setmetatable({}, {__mode="k"}) }
+local ownedConnections, ownedInstances = {}, {}
+local stopAll, destroyRuntime
+local function connect(signal, callback)
+    local c = signal:Connect(function(...)
+        if not state.destroyed then return callback(...) end
+    end)
+    table.insert(ownedConnections, c)
+    return c
+end
+local function own(instance)
+    table.insert(ownedInstances, instance)
+    return instance
+end
 
 -- ====== SAVE/LOAD ======
 local _loadingConfig = false
 local function updateUIFromState()
+    local wasLoading = _loadingConfig
+    _loadingConfig = true
     for key, h in pairs(uiHandles.checkboxes) do
         if state[key] ~= nil then pcall(function() h:Set(state[key]) end) end
     end
@@ -197,50 +170,77 @@ local function updateUIFromState()
         if state[key] ~= nil then pcall(function() h:Set(state[key]) end) end
     end
     for key, h in pairs(uiHandles.checklists) do
-        if state[key] ~= nil then pcall(function() h:Set(state[key]) end) end
+        if state[key] ~= nil then pcall(function() h:SetSelected(state[key]) end) end
     end
     if uiHandles.textboxes.configName then
         pcall(function() uiHandles.textboxes.configName:Set(state.currentConfig) end)
     end
+    _loadingConfig = wasLoading
+end
+
+local function validProfileName(name)
+    return type(name) == "string" and #name > 0 and #name <= 64
+        and name:match("^[%w_%- ]+$") ~= nil and name:match("%S") ~= nil
+end
+local NUMBER_LIMITS = {
+    updateInterval={0.05,1}, maxDistance={0,5000}, maxLabels={1,500},
+    tracerThickness={1,5}, tracerTransparency={0,1}, labelSize={10,20},
+    fov={1,180}, silentAimPredictionStrength={0,3}, gravityValue={83,500},
+    hipHeightValue={1,10}, speedValue={1,45}, fullBrightLevel={0,5},
+}
+local function savedValue(key, value)
+    local default = DEFAULT_STATE[key]
+    if default == nil or type(default) ~= type(value) then return nil end
+    if type(value) == "number" then
+        if value ~= value or math.abs(value) == math.huge then return nil end
+        local range = NUMBER_LIMITS[key]
+        return range and math.clamp(value, range[1], range[2]) or value
+    elseif type(value) == "table" then
+        local out = {}
+        for _, item in ipairs(value) do
+            if type(item) == "string" and #item <= 100 and #out < 200 then
+                table.insert(out, item)
+            end
+        end
+        return out
+    elseif type(value) == "string" then
+        if #value > 100 then return nil end
+        if key:match("Color$") and not COLOR_PRESETS[value] then return nil end
+        if key == "currentConfig" and not validProfileName(value) then return nil end
+        if key == "targetPart" and not table.find({"Head","UpperTorso","LowerTorso","Random","Closest"}, value) then return nil end
+    end
+    return value
 end
 
 local function SaveStateToConfig(name)
-    if not CFG.ready or not CFG.save then return false end
+    if not CFG.ready or not CFG.save or not validProfileName(name) then return false end
     local data = {}
-    for k, v in pairs(state) do
-        if type(v) ~= "function" and type(v) ~= "userdata" and k ~= "window" and k ~= "toggle" and k ~= "chamsResetInProgress" then
-            data[k] = v
-        end
-    end
+    for key in pairs(DEFAULT_STATE) do data[key] = state[key] end
     return CFG.save(name, data)
 end
 
 local function LoadStateFromConfig(name)
-    if not CFG.load then return false end
+    if not CFG.load or not validProfileName(name) then return false end
     local data = CFG.load(name)
-    if not data then return false end
-    _loadingConfig = true
-    local prevEsp = state.espEnabled
-    for k, v in pairs(data) do
-        if state[k] ~= nil then
-            if type(state[k]) == "table" and type(v) == "table" then
-                state[k] = {}
-                for kk, vv in pairs(v) do state[k][kk] = vv end
-            else
-                state[k] = v
-            end
-        end
+    if type(data) ~= "table" then return false end
+    if stopAll then stopAll() end
+    for key, value in pairs(data) do
+        local checked = savedValue(key, value)
+        if checked ~= nil then state[key] = checked end
     end
-    if state.espEnabled and not prevEsp then ESP.lastUpdate = 0
-    elseif not state.espEnabled and prevEsp then if ESP.cleanup then ESP.cleanup() end end
-    if HOOKS.applyNoRecoil then HOOKS.applyNoRecoil(state.noRecoil) end
-    if FB.setLevel then FB.setLevel(state.fullBrightLevel) end
-    if FB.applyTime then FB.applyTime() end
-    _loadingConfig = false
+    -- Profiles store preferences, never a running automation or player modifier.
+    for _, key in ipairs({"espEnabled","silentAim","noRecoil","noSpread","infiniteAmmo","instantReload",
+        "infiniteStamina","antiRagdoll","antiFallDamage","infiniteHorseStamina","alwaysDay",
+        "gravityEnabled","hipHeightEnabled","speedEnabled","walkUnderWater","allowGunsUnderWater",
+        "highlightGoldBars"}) do state[key] = false end
+    state.fullBrightLevel = 0
+    state.currentConfig = name
+    ESP.lastUpdate = 0
     return true
 end
 
 local function ResetStateToDefault()
+    if stopAll then stopAll() end
     for k, v in pairs(DEFAULT_STATE) do
         if type(v) == "table" then
             state[k] = {}
@@ -284,13 +284,13 @@ local function initCFG()
         return files
     end
     CFG.save = function(name, data)
-        if not ready then return false end
+        if not ready or not validProfileName(name) then return false end
         local ok, json = pcall(S.HttpService.JSONEncode, S.HttpService, data)
         if not ok then return false end
         return pcall(function() writefile(FOLDER .. name .. ".json", json) end)
     end
     CFG.load = function(name)
-        if not ready then return nil end
+        if not ready or not validProfileName(name) then return nil end
         local content
         local ok = pcall(function() content = readfile(FOLDER .. name .. ".json") end)
         if not ok or not content or content == "" then return nil end
@@ -299,15 +299,15 @@ local function initCFG()
         return decoded
     end
     CFG.delete = function(name)
-        if not ready or not canDel then return false end
-        pcall(function() delfile(FOLDER .. name .. ".json") end)
-        return true
+        if not ready or not canDel or not validProfileName(name) then return false end
+        return pcall(function() delfile(FOLDER .. name .. ".json") end)
     end
 end
 
 -- ====== FULL BRIGHT + DAY ======
 local function initFB()
     local brightConn = nil
+    local originalExposure, originalTimeBase
     local function startBright()
         if brightConn then return end
         brightConn = S.RunService.Heartbeat:Connect(function()
@@ -324,8 +324,12 @@ local function initFB()
         state.fullBrightLevel = level
         if type(level) ~= "number" or level <= 0 then
             stopBright()
-            pcall(function() S.Lighting.ExposureCompensation = 0 end)
+            if originalExposure ~= nil then
+                pcall(function() S.Lighting.ExposureCompensation = originalExposure end)
+                originalExposure = nil
+            end
         else
+            if originalExposure == nil then originalExposure = S.Lighting.ExposureCompensation end
             S.Lighting.ExposureCompensation = level
             startBright()
         end
@@ -337,6 +341,7 @@ local function initFB()
     local function startDay()
         if dayConn then return end
         if not (TimeBase and TimeSpeed) then return end
+        originalTimeBase = TimeBase.Value
         dayConn = S.RunService.Heartbeat:Connect(function()
             if state.destroyed or not state.alwaysDay then return end
             local ok, speed = pcall(function() return TimeSpeed.Value end)
@@ -350,8 +355,12 @@ local function initFB()
     end
     local function stopDay()
         if dayConn then pcall(function() dayConn:Disconnect() end); dayConn = nil end
+        if originalTimeBase ~= nil and TimeBase then
+            pcall(function() TimeBase.Value = originalTimeBase end)
+            originalTimeBase = nil
+        end
     end
-    FB.stop = function() stopBright(); stopDay() end
+    FB.stop = function() FB.setLevel(0); stopDay() end
     FB.applyTime = function() if state.alwaysDay then startDay() else stopDay() end end
     FB.setLevel(state.fullBrightLevel or 0)
 end
@@ -371,6 +380,7 @@ local function initFOV()
     end
     local function update()
         if not ring then return end
+        S.Camera = S.Workspace.CurrentCamera or S.Camera
         local vp = S.Camera.ViewportSize
         ring.Position = Vector2.new(vp.X/2, vp.Y/2)
         ring.Radius = (state.fov / 90) * 200
@@ -386,135 +396,76 @@ end
 --  PHYSICS
 -- =================================================================
 local function initPhysics()
-    local gravityConn = nil
-    local origGravity = S.Workspace.Gravity
-    local function startGravity()
-        if gravityConn then return end
-        gravityConn = S.RunService.Heartbeat:Connect(function()
-            if state.destroyed then return end
-            if state.gravityEnabled then
-                if S.Workspace.Gravity ~= state.gravityValue then
-                    S.Workspace.Gravity = state.gravityValue
-                end
-            elseif S.Workspace.Gravity ~= origGravity then
-                S.Workspace.Gravity = origGravity
-            end
-        end)
+    local connection
+    local originalGravity
+    local records = setmetatable({}, {__mode="k"})
+    local function humanoid()
+        local character = Global and Global.PlayerCharacter and Global.PlayerCharacter.Character or S.LocalPlayer.Character
+        if not character then
+            local entities = S.Workspace:FindFirstChild("WORKSPACE_Entities")
+            local players = entities and entities:FindFirstChild("Players")
+            character = players and players:FindFirstChild(S.LocalPlayer.Name)
+        end
+        return character and character:FindFirstChildOfClass("Humanoid")
     end
-    local function stopGravity()
-        if gravityConn then pcall(function() gravityConn:Disconnect() end); gravityConn = nil end
-        pcall(function() S.Workspace.Gravity = origGravity end)
+    local function restoreProperty(property)
+        for hum, record in pairs(records) do
+            if record[property] ~= nil then
+                pcall(function() hum[property] = record[property] end)
+                record[property] = nil
+            end
+        end
+    end
+    local function apply()
+        if state.destroyed then return end
+        if state.gravityEnabled then
+            if originalGravity == nil then originalGravity = S.Workspace.Gravity end
+            S.Workspace.Gravity = state.gravityValue
+        end
+        local hum = humanoid()
+        if hum then
+            local record = records[hum] or {}
+            records[hum] = record
+            for _, setting in ipairs({{"HipHeight","hipHeightEnabled","hipHeightValue"}, {"WalkSpeed","speedEnabled","speedValue"}}) do
+                if state[setting[2]] then
+                    local property = setting[1]
+                    if record[property] == nil then record[property] = hum[property] end
+                    hum[property] = state[setting[3]]
+                end
+            end
+        end
+    end
+    local function updateConnection()
+        if state.gravityEnabled or state.hipHeightEnabled or state.speedEnabled then
+            if not connection then connection = S.RunService.Heartbeat:Connect(apply) end
+            apply()
+        elseif connection then connection:Disconnect(); connection = nil end
     end
     Physics.setGravity = function(enabled, value)
-        state.gravityEnabled = enabled
-        if value then state.gravityValue = value end
-        if enabled then startGravity() else stopGravity() end
-    end
-
-    local function getLocalHumanoid()
-        local we = S.Workspace:FindFirstChild("WORKSPACE_Entities")
-        local pf = we and we:FindFirstChild("Players")
-        local lp = pf and pf:FindFirstChild(S.LocalPlayer.Name)
-        if lp then
-            local h = lp:FindFirstChild("Humanoid") or lp:FindFirstChild("Human")
-            if h and h:IsA("Humanoid") then return h end
-        end
-        local char = S.LocalPlayer.Character
-        if char then
-            local h = char:FindFirstChildOfClass("Humanoid")
-            if h then return h end
-        end
-        return nil
-    end
-
-    local hipConn = nil
-    local origHipHeight = nil
-    local function startHip()
-        if hipConn then return end
-        if origHipHeight == nil then
-            local hum = getLocalHumanoid()
-            if hum then origHipHeight = hum.HipHeight end
-        end
-        hipConn = S.RunService.Heartbeat:Connect(function()
-            if state.destroyed or not state.hipHeightEnabled then return end
-            local hum = getLocalHumanoid()
-            if hum then
-                if origHipHeight == nil then origHipHeight = hum.HipHeight end
-                if hum.HipHeight ~= state.hipHeightValue then
-                    pcall(function() hum.HipHeight = state.hipHeightValue end)
-                end
-            end
-        end)
-    end
-    local function stopHip()
-        if hipConn then pcall(function() hipConn:Disconnect() end); hipConn = nil end
-        local hum = getLocalHumanoid()
-        if hum and origHipHeight ~= nil then
-            pcall(function() hum.HipHeight = origHipHeight end)
-        end
-        origHipHeight = nil
+        state.gravityEnabled = enabled == true
+        if type(value) == "number" and value == value then state.gravityValue = math.clamp(value,83,500) end
+        if not enabled and originalGravity ~= nil then S.Workspace.Gravity = originalGravity; originalGravity = nil end
+        updateConnection()
     end
     Physics.setHipHeight = function(enabled, value)
-        state.hipHeightEnabled = enabled
-        if value then state.hipHeightValue = value end
-        if enabled then startHip() else stopHip() end
-    end
-    Physics.reapplyHip = function()
-        if state.hipHeightEnabled then
-            origHipHeight = nil
-            if hipConn then pcall(function() hipConn:Disconnect() end); hipConn = nil end
-            startHip()
-        end
-    end
-
-    local spdConn = nil
-    local origWalkSpeed = nil
-    local function startSpeed()
-        if spdConn then return end
-        if origWalkSpeed == nil then
-            local hum = getLocalHumanoid()
-            if hum then origWalkSpeed = hum.WalkSpeed end
-        end
-        spdConn = S.RunService.Heartbeat:Connect(function()
-            if state.destroyed or not state.speedEnabled then return end
-            local hum = getLocalHumanoid()
-            if hum then
-                if origWalkSpeed == nil then origWalkSpeed = hum.WalkSpeed end
-                if hum.WalkSpeed ~= state.speedValue then
-                    pcall(function() hum.WalkSpeed = state.speedValue end)
-                end
-            end
-        end)
-    end
-    local function stopSpeed()
-        if spdConn then pcall(function() spdConn:Disconnect() end); spdConn = nil end
-        local hum = getLocalHumanoid()
-        if hum and origWalkSpeed ~= nil then
-            pcall(function() hum.WalkSpeed = origWalkSpeed end)
-        end
-        origWalkSpeed = nil
+        state.hipHeightEnabled = enabled == true
+        if type(value) == "number" and value == value then state.hipHeightValue = math.clamp(value,1,10) end
+        if not enabled then restoreProperty("HipHeight") end
+        updateConnection()
     end
     Physics.setSpeed = function(enabled, value)
-        state.speedEnabled = enabled
-        if value then state.speedValue = value end
-        if enabled then startSpeed() else stopSpeed() end
+        state.speedEnabled = enabled == true
+        if type(value) == "number" and value == value then state.speedValue = math.clamp(value,1,45) end
+        if not enabled then restoreProperty("WalkSpeed") end
+        updateConnection()
     end
-    Physics.reapplySpeed = function()
-        if state.speedEnabled then
-            origWalkSpeed = nil
-            if spdConn then pcall(function() spdConn:Disconnect() end); spdConn = nil end
-            startSpeed()
-        end
-    end
-
-    Physics._stopGravity = stopGravity
-    Physics._stopHip     = stopHip
-    Physics._stopSpeed   = stopSpeed
-
+    Physics.reapplyHip = apply
+    Physics.reapplySpeed = apply
     Physics.stop = function()
-        if Physics._stopGravity then pcall(Physics._stopGravity) end
-        if Physics._stopHip     then pcall(Physics._stopHip) end
-        if Physics._stopSpeed   then pcall(Physics._stopSpeed) end
+        if connection then connection:Disconnect(); connection = nil end
+        if originalGravity ~= nil then pcall(function() S.Workspace.Gravity = originalGravity end); originalGravity = nil end
+        restoreProperty("HipHeight")
+        restoreProperty("WalkSpeed")
     end
 end
 
@@ -524,6 +475,8 @@ end
 local function initWater()
     local swimCtrl = nil
     local swimConn = nil
+    local swimOriginal
+    local gunOwner
     local function getSwim()
         if swimCtrl then return swimCtrl end
         local ok, mod = pcall(function()
@@ -538,6 +491,12 @@ local function initWater()
             if state.destroyed or not state.walkUnderWater then return end
             local sw = getSwim()
             if sw then
+                if not swimOriginal then
+                    swimOriginal = {}
+                    for _, key in ipairs({"ClampSurfaceMovement","MaxJumpDepth","SurfaceDepth","DragForceMultiplier"}) do
+                        swimOriginal[key] = {value=sw[key]}
+                    end
+                end
                 pcall(function()
                     sw.ClampSurfaceMovement = false
                     sw.MaxJumpDepth = 0
@@ -549,13 +508,9 @@ local function initWater()
     end
     local function stopWW()
         if swimConn then pcall(function() swimConn:Disconnect() end); swimConn = nil end
-        local sw = getSwim()
-        if sw then
-            pcall(function()
-                sw.ClampSurfaceMovement = true
-                sw.SurfaceDepth = 0.35
-                sw.DragForceMultiplier = 9.85
-            end)
+        if swimCtrl and swimOriginal then
+            for key, record in pairs(swimOriginal) do pcall(function() swimCtrl[key] = record.value end) end
+            swimOriginal = nil
         end
     end
     Water.setWalkUnderWater = function(enabled)
@@ -566,7 +521,10 @@ local function initWater()
     local function applyGunsUW()
         if not Global or not Global.PlayerCharacter then return end
         local pc = Global.PlayerCharacter
-        if not origCanSwitch then origCanSwitch = pc.CanSwitchToItem end
+        if gunOwner == pc and origCanSwitch then return end
+        if gunOwner and origCanSwitch then gunOwner.CanSwitchToItem = origCanSwitch end
+        gunOwner = pc
+        origCanSwitch = pc.CanSwitchToItem
         if type(origCanSwitch) ~= "function" then return end
         pc.CanSwitchToItem = function(self, itemData, silent, ...)
             local prevSwim = self.Swimming
@@ -581,9 +539,9 @@ local function initWater()
         end
     end
     local function removeGunsUW()
-        if not Global or not Global.PlayerCharacter or not origCanSwitch then return end
-        pcall(function() Global.PlayerCharacter.CanSwitchToItem = origCanSwitch end)
+        if gunOwner and origCanSwitch then pcall(function() gunOwner.CanSwitchToItem = origCanSwitch end) end
         origCanSwitch = nil
+        gunOwner = nil
     end
     Water.setAllowGunsUnderWater = function(enabled)
         state.allowGunsUnderWater = enabled
@@ -597,6 +555,152 @@ end
 -- =================================================================
 --  ESP
 -- =================================================================
+local EVENT_HOSTILES = {Zombie=true, ZombieSoldier=true, BossZombie=true, ColonelBoss=true}
+local EVENT_GUIDES = {DemonHunterJane=true, BogWitch=true}
+local function initAdapter()
+    local npcModule = Global and Global.ClientNPCs
+    Adapter.npcValues = function(container)
+        local states = Global and Global.ClientNPCState
+        local id = container and tonumber(container:GetAttribute("ID"))
+        if states and type(states.FindValues) == "function" and id then
+            local ok, values = pcall(states.FindValues, id)
+            if ok and type(values) == "table" then return values end
+        end
+        return nil
+    end
+    Adapter.resolveNPC = function(container)
+        if not container or not container.Parent then return nil end
+        local values = Adapter.npcValues(container)
+        if values and (values.Hidden == true or (type(values.Health) == "number" and values.Health <= 0)) then return nil end
+        local native = npcModule and npcModule.NPC_Map and npcModule.NPC_Map[container]
+        if native and (native.Unloaded or (native.Attributes and native.Attributes.Hidden)) then return nil end
+        local rig = native and native.Character
+        if typeof(rig) ~= "Instance" or not rig:IsA("Model") or not rig:IsDescendantOf(S.Workspace) then
+            rig = nil
+            -- Mounted NPCs also parent a SpectralHorse here. Prefer the rider's torso rig.
+            local bestScore = 0
+            local function consider(model)
+                if not model:IsA("Model") then return end
+                local root = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("RootPart")
+                local head = model:FindFirstChild("Head")
+                local torso = model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso") or model:FindFirstChild("LowerTorso")
+                local score = (root and root:IsA("BasePart") and 1 or 0)
+                    + (head and head:IsA("BasePart") and 2 or 0)
+                    + (torso and torso:IsA("BasePart") and 8 or 0)
+                if score > bestScore then rig = model; bestScore = score end
+            end
+            for _, child in ipairs(container:GetChildren()) do
+                consider(child)
+            end
+            local legacy = container:FindFirstChild("Model")
+            if legacy then
+                consider(legacy)
+                for _, child in ipairs(legacy:GetDescendants()) do consider(child) end
+            end
+        end
+        if not rig or not rig:IsDescendantOf(S.Workspace) then return nil end
+        Adapter.npcByRig[rig] = values or (native and native.Attributes)
+        return rig
+    end
+    Adapter.actionPart = function(action)
+        if not action or not action:IsDescendantOf(S.Workspace) then return nil end
+        local part = action:IsA("BillboardGui") and action.Adornee or nil
+        if part and part:IsA("Attachment") then part = part.Parent end
+        if not part then part = action.Parent end
+        if part and part:IsA("BasePart") then return part end
+        return nil
+    end
+    local function addAction(action)
+        if action.Name == "PickupForageable" then Adapter.plants[action] = true end
+    end
+    for _, action in ipairs(S.CollectionService:GetTagged("ObjectActionGroup")) do addAction(action) end
+    connect(S.CollectionService:GetInstanceAddedSignal("ObjectActionGroup"), addAction)
+    connect(S.CollectionService:GetInstanceRemovedSignal("ObjectActionGroup"), function(action) Adapter.plants[action] = nil end)
+    Adapter.snapshot = function()
+        local result = {hostiles=0, guides=0, loaded=0, plants=0, cauldrons=0, boss="Not present in replicated NPC metadata"}
+        local entities = S.Workspace:FindFirstChild("WORKSPACE_Entities")
+        local npcs = entities and entities:FindFirstChild("NPCs")
+        if npcs then for _, container in ipairs(npcs:GetChildren()) do
+            local kind = container:GetAttribute("Type")
+            local values = Adapter.npcValues(container)
+            local alive = not values or (values.Hidden ~= true and (type(values.Health) ~= "number" or values.Health > 0))
+            if alive and (EVENT_HOSTILES[kind] or EVENT_GUIDES[kind]) then
+                if EVENT_HOSTILES[kind] then result.hostiles += 1 else result.guides += 1 end
+                if Adapter.resolveNPC(container) then result.loaded += 1 end
+            end
+            if kind == "ColonelBoss" and values then
+                result.boss = string.format("%.0f / %.0f HP | %s", tonumber(values.Health) or 0,
+                    tonumber(values.MaxHealth) or 0, tostring(values.BossState or "State unavailable"))
+            end
+        end end
+        for action in pairs(Adapter.plants) do
+            if action:GetAttribute("Disabled") ~= true and Adapter.actionPart(action) then result.plants += 1 end
+        end
+        for _, model in ipairs(S.CollectionService:GetTagged("HalloweenCauldron")) do
+            if model:IsDescendantOf(S.Workspace) then result.cauldrons += 1 end
+        end
+        return result
+    end
+end
+
+local function readEntityHealth(character)
+    if not character then return nil, nil, false end
+    local function finite(value, positive)
+        if type(value) ~= "number" and type(value) ~= "string" then return nil end
+        value = tonumber(value)
+        if not value or value ~= value or math.abs(value) >= math.huge then return nil end
+        if positive then return value > 0 and value or nil end
+        return math.max(0, value)
+    end
+    local function valueChild(parent, name, positive)
+        local value = parent and parent:FindFirstChild(name)
+        if value and (value:IsA("NumberValue") or value:IsA("IntValue")) then return finite(value.Value, positive) end
+        return nil
+    end
+    local function attribute(name, alternate, positive)
+        local value = finite(character:GetAttribute(name), positive)
+        if value == nil and alternate then value = finite(character:GetAttribute(alternate), positive) end
+        return value
+    end
+    local npc = Adapter.npcByRig[character]
+    local wildlife = Global and Global.WildLife
+    local animal
+    if wildlife and type(wildlife.GetWildLifeObject) == "function" then
+        local ok, result = pcall(wildlife.GetWildLifeObject, wildlife, character)
+        if ok and type(result) == "table" and result.character == character then animal = result end
+    end
+    local parent = character.Parent
+    local inAnimals = parent and parent.Name == "Animals" and parent.Parent and parent.Parent.Name == "WORKSPACE_Entities"
+    local horseStats = character:FindFirstChild("HorseStats")
+    local isAnimal = not npc and (animal ~= nil or inAnimals or horseStats ~= nil
+        or (character:FindFirstChild("RigType") ~= nil and character:FindFirstChild("Health") ~= nil))
+    local healthValue = valueChild(character, "Health")
+    local maxValue = valueChild(character, "MaxHealth", true)
+    if isAnimal then
+        -- Wildlife Humanoids are animation controllers, commonly fixed at 100/100.
+        local health = healthValue or attribute("Health", "HP") or (animal and finite(animal.Health))
+        -- Horse class MaxHealth is a breed range, not this individual horse's maximum.
+        local maximum = maxValue or attribute("MaxHealth", "MaxHP", true)
+            or valueChild(horseStats, "Health", true)
+            or (animal and finite(rawget(animal, "MaxHealth"), true))
+        return health, maximum, true
+    end
+    local controller = character:FindFirstChild("Human") or character:FindFirstChild("Humanoid")
+        or character:FindFirstChildOfClass("Humanoid")
+    return (npc and finite(npc.Health)) or (controller and finite(controller.Health)) or healthValue or attribute("Health", "HP"),
+        (npc and finite(npc.MaxHealth, true)) or (controller and finite(controller.MaxHealth, true)) or maxValue or attribute("MaxHealth", "MaxHP", true), false
+end
+
+local function formatEntityHealth(character)
+    local health, maximum = readEntityHealth(character)
+    if health == nil then return "HP unavailable" end
+    if maximum and maximum >= health then
+        return string.format("%.0f/%.0f HP", math.ceil(health), math.ceil(maximum))
+    end
+    -- A missing replicated maximum is unknown; never invent 100 or assume current HP is full HP.
+    return string.format("%.0f HP", math.ceil(health))
+end
+
 local function initESP()
     local folderCache, folderCacheTime = {}, {}
     local drawings, espObjects = {}, {}
@@ -615,7 +719,7 @@ local function initESP()
     local function getFolder(path)
         local cached = folderCache[path]
         if cached ~= nil then
-            if cached ~= false then return cached end
+            if cached ~= false and cached.Parent then return cached end
             if os.clock() - (folderCacheTime[path] or 0) < 3 then return nil end
         end
         folderCacheTime[path] = os.clock()
@@ -765,27 +869,20 @@ local function initESP()
         return m:FindFirstChildWhichIsA("BasePart", true)
     end
     local function getHealth(c)
-        if not c then return 100 end
-        local h = getController(c)
-        if h and h.Health then return math.floor(h.Health) end
-        local hv = c:FindFirstChild("Health")
-        if hv and hv:IsA("NumberValue") then return math.floor(hv.Value) end
-        local a = c:GetAttribute("Health") or c:GetAttribute("HP")
-        if a then return math.floor(tonumber(a) or 100) end
-        return 100
+        local health = readEntityHealth(c)
+        return health
     end
     local function getMaxHealth(c)
-        if not c then return 100 end
-        local h = getController(c)
-        if h and h.MaxHealth then return math.floor(h.MaxHealth) end
-        local hv = c:FindFirstChild("MaxHealth")
-        if hv and hv:IsA("NumberValue") then return math.floor(hv.Value) end
-        local a = c:GetAttribute("MaxHealth") or c:GetAttribute("MaxHP")
-        if a then return math.floor(tonumber(a) or 100) end
-        return 100
+        local _, maximum = readEntityHealth(c)
+        return maximum
     end
     local function isAlive(c)
         if not c then return false end
+        local values = Adapter.npcByRig[c]
+        if values and (values.Hidden == true or (type(values.Health) == "number" and values.Health <= 0)) then return false end
+        local health, _, animal = readEntityHealth(c)
+        if health ~= nil and health <= 0 then return false end
+        if animal then return true end
         local h = getController(c)
         if h then
             if h.Health and h.Health <= 0 then return false end
@@ -889,6 +986,7 @@ local function initESP()
     local function createHighlight(part, color, transp)
         if not isBasePart(part) then return nil end
         local h = Instance.new("Highlight")
+        h.Name = "TWW_EntityHighlight"
         h.Adornee = part
         h.FillColor = color
         h.FillTransparency = transp or 0.5
@@ -929,8 +1027,15 @@ local function initESP()
     end
     local function cleanupOne(esp)
         if esp.highlight then pcall(function() esp.highlight:Destroy() end); esp.highlight = nil end
-        if esp.label then esp.label.Visible = false end
-        if esp.tracer then esp.tracer.Visible = false end
+        for _, key in ipairs({"label", "tracer"}) do
+            local drawing = esp[key]
+            if drawing then
+                pcall(function() drawing:Remove() end)
+                local index = table.find(drawings, drawing)
+                if index then table.remove(drawings, index) end
+                esp[key] = nil
+            end
+        end
         if esp.chams then
             for _, hl in pairs(esp.chams) do pcall(function() hl:Destroy() end) end
             esp.chams = {}
@@ -1119,7 +1224,7 @@ local function initESP()
             end
             if state.showDistance and dist then tp[#tp+1] = string.format("%.0f studs", dist) end
             if state.showHealth and showHp and char then
-                tp[#tp+1] = string.format("%.0f/%.0f HP", getHealth(char), getMaxHealth(char))
+                tp[#tp+1] = formatEntityHealth(char)
             end
             esp.label.Text = table.concat(tp, " | ")
             esp.label.Color = color
@@ -1136,7 +1241,8 @@ local function initESP()
             local feetSp3 = S.Camera:WorldToViewportPoint(feetWorld)
             if feetSp3.Z > 0 then
                 if not esp.tracer then esp.tracer = createTracer() end
-                local vp = S.Camera.ViewportSize
+                S.Camera = S.Workspace.CurrentCamera or S.Camera
+        local vp = S.Camera.ViewportSize
                 esp.tracer.From         = Vector2.new(math.floor(vp.X * 0.5), math.floor(vp.Y))
                 esp.tracer.To           = Vector2.new(feetSp3.X, feetSp3.Y)
                 esp.tracer.Color        = COLOR_PRESETS[state.tracerColor] or Color3.fromRGB(0,255,255)
@@ -1233,47 +1339,24 @@ local function initESP()
         if state.showNPCs then
             local ef = S.Workspace:FindFirstChild("WORKSPACE_Entities")
             local nf = ef and ef:FindFirstChild("NPCs")
-            if nf then
-                for _, n in pairs(nf:GetChildren()) do
-                    local char = n
-                    local modelFolder = n:FindFirstChild("Model")
-                    if modelFolder then
-                        local nm = modelFolder:FindFirstChild("NPCTemplateNoHumanV4")
-                        if nm and nm:IsA("Model") then char = nm end
-                        if not char or not char:FindFirstChildOfClass("Humanoid") then
-                            local alt = modelFolder:FindFirstChildWhichIsA("Model", true)
-                            if alt and alt:FindFirstChildOfClass("Humanoid") then char = alt end
-                        end
-                    end
-                    if not char:IsA("Model") or not char:FindFirstChildOfClass("Humanoid") then
-                        local alt = n:FindFirstChildWhichIsA("Model", true)
-                        if alt then char = alt end
-                    end
-                    if char and char:IsA("Model") and n.Name ~= S.LocalPlayer.Name and isAlive(char) then
-                        local root = getRoot(char)
-                        if root then
-                            local d = getDistance(root)
-                            if state.maxDistance == 0 or d <= state.maxDistance then
-                                local p = getTargetPart(char)
-                                if p then
-                                    active[n] = true
-                                    local esp = getESP(n)
-                                    esp.entityType = "npc"
-                                    local c = COLOR_PRESETS[state.npcColor] or Color3.fromRGB(255,255,0)
-                                    renderEntityESP(esp, p, {color=c, heightOffset=2, showHealthData=true,
-                                        character=char, name=n.Name, distance=d, showTracers=false})
-                                    local within500 = (d <= CHAMS_TRACER_MAX_DIST)
-                                    if within500 then
-                                        renderChams(esp, char, c, "npc", false)
-                                    elseif esp.chams then
-                                        for _, hl in pairs(esp.chams) do if hl then hl.Enabled = false end end
-                                    end
-                                end
-                            end
+            if nf then for _, container in ipairs(nf:GetChildren()) do
+                do
+                    local rig = Adapter.resolveNPC(container)
+                    if rig and isAlive(rig) then
+                        local part = getTargetPart(rig)
+                        local distance = part and getDistance(part)
+                        if distance and (state.maxDistance == 0 or distance <= state.maxDistance) then
+                            active[container] = true
+                            local esp = getESP(container)
+                            esp.entityType = "npc"
+                            local color = COLOR_PRESETS[state.npcColor] or COLOR_PRESETS.Purple
+                            renderEntityESP(esp, part, {color=color, heightOffset=2, showHealthData=true,
+                                character=rig, name=container.Name, distance=distance, showTracers=false})
+                            if distance <= CHAMS_TRACER_MAX_DIST then renderChams(esp, rig, color, "npc", false) end
                         end
                     end
                 end
-            end
+            end end
         end
 
         if state.showAnimals or state.showHorses then
@@ -1532,6 +1615,26 @@ local function initESP()
             end
         end
 
+        local function marker(key, part, name, color)
+            if not part or not part:IsA("BasePart") or not part:IsDescendantOf(S.Workspace) then return end
+            local distance = getDistance(part)
+            if state.maxDistance > 0 and distance > state.maxDistance then return end
+            active[key] = true
+            local esp = getESP(key)
+            esp.entityType = "event"
+            renderEntityESP(esp, part, {color=color, heightOffset=2, showHealthData=false,
+                name=name, distance=distance, showTracers=false})
+        end
+        if state.showPlants then
+            for action in pairs(Adapter.plants) do
+                if action:GetAttribute("Disabled") ~= true then
+                    local item = action:GetAttribute("ItemType")
+                    if type(item) == "string" then
+                        marker(action, Adapter.actionPart(action), item, COLOR_PRESETS.Green)
+                    end
+                end
+            end
+        end
         updateThunderstruck(active)
         updateGoldBars()
         cleanupStale(active)
@@ -1564,16 +1667,110 @@ end
 -- =================================================================
 --  CHAR
 -- =================================================================
+local function resolveNativeRagdollMethods(global, storage, environment, session)
+    if type(getfenv) ~= "function" or type(debug.getconstants) ~= "function" or type(debug.getupvalues) ~= "function" then
+        return nil, "Native ragdoll inspection is unavailable; rejoin with a supported executor."
+    end
+    local modules = storage:FindFirstChild("Modules")
+    local character = modules and modules:FindFirstChild("Character")
+    local playerScript = character and character:FindFirstChild("PlayerCharacter")
+    local ragdollsScript = character and character:FindFirstChild("Ragdolls")
+    local sharedModules = storage:FindFirstChild("SharedModules")
+    local globalModule = sharedModules and sharedModules:FindFirstChild("Global")
+    local networkScript = globalModule and globalModule:FindFirstChild("Network")
+    if not playerScript or not ragdollsScript or not networkScript then
+        return nil, "Native ragdoll inspection is unavailable; rejoin with a supported executor."
+    end
+    local signatures = {
+        Ragdoll={"StopFlight","ToggleSelfRagdoll","CreateRagdollForce","EnterRagdoll"},
+        ToggleSelfRagdoll={"Disabled SelfRagdoll when dead","ControlRagdoll","UncontrolRagdoll"},
+        OnControlLost={"StopSpectating","DropCrate","UnMount","FaceMouse","WalkSpeed"},
+        RequestKnockback={"IsRagdolled","IsDead","IsTiedUp","FindFirstChild","Ragdoll","CFrame"},
+        EnterRagdoll={"ToggleCollisionModel","ToggleWeldsActive","RagdollImpactListeners","VectorForce"},
+        FireServer={"GetHandler","Event","Remote","FireServer","task","spawn"},
+    }
+    local function matches(fn, name)
+        if type(fn) ~= "function" then return false end
+        local ok, scope = pcall(getfenv, fn)
+        local source = name == "EnterRagdoll" and ragdollsScript or name == "FireServer" and networkScript or playerScript
+        if not ok or type(scope) ~= "table" or scope.script ~= source then return false end
+        local got, constants = pcall(debug.getconstants, fn)
+        if not got or type(constants) ~= "table" then return false end
+        local strings = {}
+        for _, value in pairs(constants) do if type(value) == "string" then strings[value] = true end end
+        for _, value in ipairs(signatures[name]) do if not strings[value] then return false end end
+        -- The same module also exports FireServerUnreliable with otherwise identical constants.
+        if name == "FireServer" and strings.Unreliable then return false end
+        if name ~= "RequestKnockback" and name ~= "FireServer" then
+            local read, values = pcall(debug.getupvalues, fn)
+            if not read or type(values) ~= "table" then return false end
+            local ownsGlobal = false
+            for _, value in pairs(values) do if value == global then ownsGlobal = true; break end end
+            if not ownsGlobal then return false end
+        end
+        return true
+    end
+    local cache = environment.TWWNativeCharacterMethods
+    local cached = type(cache) == "table" and cache.global == global
+        and cache.jobId == session.jobId and cache.placeId == session.placeId and cache.methods
+    local methods, missing = {}, {}
+    local pc = global.PlayerCharacter
+    local legacyNoop = false
+    for name in pairs(signatures) do
+        local owner = name == "EnterRagdoll" and global.Ragdolls or name == "FireServer" and global.Network or pc
+        local current = owner[name]
+        if matches(current, name) then methods[name] = current
+        elseif type(cached) == "table" and matches(cached[name], name) then methods[name] = cached[name]
+        else missing[name] = {} end
+        if type(current) == "function" then
+            local ok, constants = pcall(debug.getconstants, current)
+            if ok and type(constants) == "table" and next(constants) == nil then legacyNoop = true end
+        end
+    end
+    if next(missing) then
+        if type(getgc) ~= "function" then return nil, "Native ragdoll callbacks were replaced; rejoin to restore them." end
+        local ok, objects = pcall(getgc, false)
+        if not ok or type(objects) ~= "table" then return nil, "Cannot locate native ragdoll callbacks; rejoin to restore them." end
+        local checked = 0
+        -- Executor GC arrays can have holes: ipairs silently misses the surviving original closures.
+        for _, fn in pairs(objects) do
+            if type(fn) == "function" then
+                for name, candidates in pairs(missing) do
+                    if matches(fn, name) then candidates[fn] = true end
+                end
+                checked += 1
+                if checked % 10000 == 0 then task.wait() end
+            end
+        end
+        for name, candidates in pairs(missing) do
+            local original = next(candidates)
+            if not original or next(candidates, original) ~= nil then
+                return nil, "Cannot uniquely identify native " .. name .. "; rejoin before using Prevent Ragdoll."
+            end
+            methods[name] = original
+        end
+    end
+    -- Keep the actual live closures: recompiling them would separate private ragdoll state.
+    environment.TWWNativeCharacterMethods = {
+        global=global,jobId=session.jobId,placeId=session.placeId,methods=methods,
+    }
+    return methods, nil, legacyNoop
+end
+
 local function initChar()
     local PC = nil
     local Orig = {}
     local NetHooked = false
     local PinnedHorse = nil
+    local pinnedState
     local ready = false
-    local PIN_MT = {
-        __index = function(_, key) if key == "Stamina" then return 100 end return nil end,
-        __newindex = function(t, key, value) if key == "Stamina" then return end rawset(t, key, value) end,
-    }
+    local PIN_MT
+    local ragdollGuard
+    local nativeOwner, nativeMethods, nativeAttemptedOwner
+    local pendingLegacyRecovery = false
+    local recoveryOwner, recoveryCharacter
+    local lastGetUp = -math.huge
+    local recoveryBusy = false
     local function ensureWritable(t)
         if typeof(t) ~= "table" then return end
         if type(isreadonly) == "function" and isreadonly(t) then
@@ -1583,10 +1780,29 @@ local function initChar()
             end)
         end
     end
+    local function restoreNativeRagdollMethods(pc)
+        if nativeOwner == pc then return true end
+        if nativeAttemptedOwner == pc then return false end
+        nativeAttemptedOwner = pc
+        local methods, err, legacy = resolveNativeRagdollMethods(Global, S.ReplicatedStorage, environment,
+            {placeId=game.PlaceId,jobId=game.JobId})
+        if not methods or state.destroyed or Global.PlayerCharacter ~= pc then
+            CHAR.lastRagdollRecoveryError = err or "Character changed during native callback recovery."
+            warn("[TWW] " .. CHAR.lastRagdollRecoveryError)
+            return false
+        end
+        for name, fn in pairs(methods) do
+            local owner = name == "EnterRagdoll" and Global.Ragdolls or name == "FireServer" and Global.Network or pc
+            ensureWritable(owner)
+            if name == "FireServer" and NetHooked then Orig.FireServer = fn else owner[name] = fn end
+        end
+        nativeOwner, nativeMethods = pc, methods
+        pendingLegacyRecovery = legacy
+        return true
+    end
     local function looksLikeOriginal(f)
         if typeof(f) ~= "function" then return false end
-        local info = debug.getinfo(f)
-        return (info.nups or 0) > 0 or (info.numparams or info.nump or 0) > 0
+        return true
     end
     local function refreshPC()
         local pc = Global.PlayerCharacter
@@ -1595,12 +1811,6 @@ local function initChar()
             if looksLikeOriginal(pc.LowerStamina) then
                 Orig.LowerStamina = pc.LowerStamina
                 Orig.LocalLowerStamina = pc.LocalLowerStamina
-            end
-            if looksLikeOriginal(pc.Ragdoll) then
-                Orig.Ragdoll = pc.Ragdoll
-                Orig.RequestKnockback = pc.RequestKnockback
-                Orig.ToggleSelfRagdoll = pc.ToggleSelfRagdoll
-                Orig.OnControlLost = pc.OnControlLost
             end
         end
         return PC
@@ -1614,7 +1824,7 @@ local function initChar()
         NetHooked = true
         Network.FireServer = function(self, eventName, ...)
             if state.antiRagdoll then
-                if eventName == "EnterRagdoll" or eventName == "DamageSelf" then return end
+                if eventName == "DamageSelf" then return end
             end
             if state.antiFallDamage and not state.antiRagdoll then
                 if eventName == "DamageSelf" then return end
@@ -1643,7 +1853,27 @@ local function initChar()
         pc.LocalLowerStamina = function() end
         local ps = Global.ReplicatedState.State
         ensureWritable(ps)
-        if getmetatable(ps) ~= PIN_MT then pcall(function() setmetatable(ps, PIN_MT) end) end
+        if not pinnedState then
+            local originalMT = getmetatable(ps)
+            if originalMT ~= nil and type(originalMT) ~= "table" then return false end
+            PIN_MT = originalMT and table.clone(originalMT) or {}
+            local index = originalMT and originalMT.__index
+            local newIndex = originalMT and originalMT.__newindex
+            PIN_MT.__index = function(t, key)
+                if key == "Stamina" then return 100 end
+                if type(index) == "function" then return index(t, key) end
+                if type(index) == "table" then return index[key] end
+                return nil
+            end
+            PIN_MT.__newindex = function(t, key, value)
+                if key == "Stamina" then return end
+                if type(newIndex) == "function" then newIndex(t, key, value)
+                elseif type(newIndex) == "table" then newIndex[key] = value
+                else rawset(t, key, value) end
+            end
+            pinnedState = {state=ps,value=rawget(ps,"Stamina"),mt=originalMT}
+            if not pcall(setmetatable, ps, PIN_MT) then pinnedState = nil; PIN_MT = nil; return false end
+        end
         rawset(ps, "Stamina", nil)
         pcall(function()
             local sig = Global.ReplicatedState:GetStateChangedSignal("Stamina")
@@ -1659,56 +1889,126 @@ local function initChar()
             if Orig.LowerStamina then pc.LowerStamina = Orig.LowerStamina end
             if Orig.LocalLowerStamina then pc.LocalLowerStamina = Orig.LocalLowerStamina end
         end
-        local ps = Global.ReplicatedState and Global.ReplicatedState.State
-        if typeof(ps) == "table" and getmetatable(ps) == PIN_MT then
-            pcall(function() setmetatable(ps, nil) end)
-            rawset(ps, "Stamina", 100)
+        if pinnedState then
+            local ps = pinnedState.state
+            if getmetatable(ps) == PIN_MT then
+                pcall(setmetatable, ps, pinnedState.mt)
+                rawset(ps, "Stamina", pinnedState.value)
+            end
+            pinnedState = nil
+            PIN_MT = nil
         end
     end
 
-    -- ============ ANTI RAGDOLL (only local player) ============
+    -- Guard optional local starts, never the game's entry/exit or mount cleanup state machine.
+    local function nativeFlag(method, owner, ...)
+        if type(method) ~= "function" then return false end
+        local ok, value = pcall(method, owner, ...)
+        return ok and value == true
+    end
+    local function serverRagdolled(pc)
+        local playerState = Global.ReplicatedState and Global.ReplicatedState.State
+        return (type(pc.State) == "table" and pc.State.Ragdolled == true)
+            or (type(playerState) == "table" and playerState.Ragdolled == true)
+    end
+    local function localRagdolled(character)
+        local ragdolls = Global.Ragdolls
+        return ragdolls and nativeFlag(ragdolls.IsRagdolledLocal, ragdolls, character)
+    end
+    local function restoreRagdollGuard()
+        if ragdollGuard then
+            local record = ragdollGuard
+            ensureWritable(record.owner)
+            if record.owner.Ragdoll == record.wrapper then record.owner.Ragdoll = record.original end
+            ragdollGuard = nil
+        end
+    end
+    local function recoverRagdoll()
+        if not ready or state.destroyed or not state.antiRagdoll or recoveryBusy then return false end
+        local pc = Global.PlayerCharacter
+        if type(pc) ~= "table" or not pc.Character or pc.IsDead or pc.IsTiedUp then return false end
+        if not restoreNativeRagdollMethods(pc) then return false end
+        local character = pc.Character
+        if typeof(character) == "Instance" and not character:IsDescendantOf(S.Workspace) then return false end
+        if recoveryOwner ~= pc or recoveryCharacter ~= character then
+            recoveryOwner, recoveryCharacter = pc, character
+            lastGetUp = -math.huge
+        end
+        local function current()
+            return not state.destroyed and state.antiRagdoll
+                and Global.PlayerCharacter == pc and pc.Character == character
+                and not pc.IsDead and not pc.IsTiedUp
+        end
+        recoveryBusy = true
+        local ok, attempted = pcall(function()
+            -- An older no-op can detach a horse without setting any ragdoll flag, leaving Physics forever.
+            if pendingLegacyRecovery then
+                local mount = Global.WildLife and Global.WildLife.RidingAnimal
+                local root, human = pc.RootPart, pc.Human
+                local weld = root and root:FindFirstChild("Animal_To_Player")
+                if not mount and not (weld and weld.Part1) then
+                    pendingLegacyRecovery = false
+                    if human and human:GetState() == Enum.HumanoidStateType.Physics
+                        and not serverRagdolled(pc) and not localRagdolled(character)
+                        and nativeFlag(pc.HasFullControl, pc) then
+                        nativeMethods.Ragdoll(pc, nil, true)
+                        if not current() then return false end
+                    end
+                end
+            end
+            -- Repair a server-accepted / physical ragdoll whose local flag was blocked by an older hook.
+            -- This is the same entry sequence as the native EnterRagdoll event handler.
+            if (serverRagdolled(pc) or localRagdolled(character)) and nativeFlag(pc.HasFullControl, pc) then
+                if type(pc.OnControlLost) ~= "function" or type(pc.ToggleSelfRagdoll) ~= "function" then return false end
+                pc:OnControlLost()
+                if not current() then return false end
+                pc:ToggleSelfRagdoll(true)
+            end
+            if not current() or not nativeFlag(pc.CanGetUp, pc) or type(pc.GetUp) ~= "function" then return false end
+            if os.clock() - lastGetUp < 1.5 then return false end
+            lastGetUp = os.clock()
+            -- GetUp performs the native AttemptGetUp RPC and preserves cooldowns, animation and acknowledgement.
+            pc:GetUp()
+            return true
+        end)
+        recoveryBusy = false
+        if not ok then
+            CHAR.lastRagdollRecoveryError = tostring(attempted)
+            warn("[TWW] Ragdoll recovery: " .. tostring(attempted))
+            return false
+        end
+        CHAR.lastRagdollRecoveryError = nil
+        return attempted == true
+    end
     local function applyAntiRagdoll()
         if not ready then return false end
         local pc = refreshPC()
-        if not pc then return false end
-        ensureWritable(pc)
-        pc.Ragdoll = function() end
-        pc.RequestKnockback = function() end
-        pc.ToggleSelfRagdoll = function() end
-        pc.OnControlLost = function() end
-
-        local R = Global.Ragdolls
-        ensureWritable(R)
-        if not Orig.RagdollsEnterRagdoll then
-            Orig.RagdollsEnterRagdoll = R.EnterRagdoll
-        end
-
-        -- Only block ragdoll for the LOCAL player's own character.
-        -- Other players / NPCs / animals still ragdoll normally.
-        R.EnterRagdoll = function(self, char, ...)
-            local localChar = Global.PlayerCharacter and Global.PlayerCharacter.Character
-            if char and localChar and char == localChar then
-                return
+        if not pc or type(pc.Ragdoll) ~= "function" then return false end
+        if ragdollGuard and (ragdollGuard.owner ~= pc or pc.Ragdoll ~= ragdollGuard.wrapper) then restoreRagdollGuard() end
+        if not restoreNativeRagdollMethods(pc) then return false end
+        if not ragdollGuard then
+            local original = nativeMethods.Ragdoll
+            local function wrapper(self, ...)
+                -- UnMount(true) already detached the rider and passes this flag; its transition must finish.
+                local forcedTransition = select(2, ...) == true
+                if self == pc and self == Global.PlayerCharacter and state.antiRagdoll and not state.destroyed
+                    and not forcedTransition
+                    and not self.IsDead and not self.IsTiedUp and not serverRagdolled(self)
+                    and not localRagdolled(self.Character) and nativeFlag(self.HasFullControl, self) then
+                    return
+                end
+                return original(self, ...)
             end
-            return Orig.RagdollsEnterRagdoll(self, char, ...)
+            ensureWritable(pc)
+            pc.Ragdoll = wrapper
+            ragdollGuard = {owner=pc,original=original,wrapper=wrapper}
         end
         return true
     end
     local function removeAntiRagdoll()
-        if not ready then return end
-        local pc = PC or Global.PlayerCharacter
-        if typeof(pc) == "table" then
-            ensureWritable(pc)
-            if Orig.Ragdoll then pc.Ragdoll = Orig.Ragdoll end
-            if Orig.RequestKnockback then pc.RequestKnockback = Orig.RequestKnockback end
-            if Orig.ToggleSelfRagdoll then pc.ToggleSelfRagdoll = Orig.ToggleSelfRagdoll end
-            if Orig.OnControlLost then pc.OnControlLost = Orig.OnControlLost end
-        end
-        local R = Global.Ragdolls
-        if typeof(R) == "table" and Orig.RagdollsEnterRagdoll then
-            ensureWritable(R)
-            R.EnterRagdoll = Orig.RagdollsEnterRagdoll
-        end
+        restoreRagdollGuard()
+        recoveryOwner, recoveryCharacter = nil, nil
+        lastGetUp = -math.huge
     end
 
     local function applyAntiFallDamage() return true end
@@ -1734,6 +2034,7 @@ local function initChar()
             end,
         }
     end
+    local removeHorseStamina
     local function applyHorseStamina()
         if not ready then return false end
         local animal = Global.WildLife and Global.WildLife.RidingAnimal
@@ -1741,18 +2042,19 @@ local function initChar()
         local mt = getmetatable(animal)
         if typeof(mt) == "table" and mt.__TWW_PIN then return true end
         ensureWritable(animal)
-        PinnedHorse = {animal=animal, origMT=mt}
+        if PinnedHorse then removeHorseStamina() end
+        PinnedHorse = {animal=animal, origMT=mt, boosts=rawget(animal,"Boosts")}
         pcall(function() setmetatable(animal, makeHorsePinMT(mt)) end)
         rawset(animal, "Boosts", nil)
         return true
     end
-    local function removeHorseStamina()
+    removeHorseStamina = function()
         if not PinnedHorse then return end
         local animal = PinnedHorse.animal
         if typeof(animal) == "table" then
             ensureWritable(animal)
             pcall(function() setmetatable(animal, PinnedHorse.origMT) end)
-            rawset(animal, "Boosts", rawget(animal, "MaxBoosts") or 3)
+            rawset(animal, "Boosts", PinnedHorse.boosts)
         end
         PinnedHorse = nil
     end
@@ -1773,6 +2075,7 @@ local function initChar()
     CHAR.removeInfiniteStamina = removeInfiniteStamina
     CHAR.applyAntiRagdoll = applyAntiRagdoll
     CHAR.removeAntiRagdoll = removeAntiRagdoll
+    CHAR.recoverRagdoll = recoverRagdoll
     CHAR.applyAntiFallDamage = applyAntiFallDamage
     CHAR.removeAntiFallDamage = removeAntiFallDamage
     CHAR.applyHorseStamina = applyHorseStamina
@@ -1796,25 +2099,27 @@ local function initChar()
             if os.clock() - t0 > 60 then return end
             task.wait(0.25)
         end
+        if state.destroyed then return end
+        restoreNativeRagdollMethods(Global.PlayerCharacter)
         CHAR.sync()
-        if AMMO.install then AMMO.install() end
+        if (state.infiniteAmmo or state.instantReload) and AMMO.install then AMMO.install() end
         if Water then Water.reapply() end
     end)
 
     task.spawn(function()
+        local nextSync = 0
         while not state.destroyed do
-            task.wait(2)
+            task.wait(0.25)
+            if state.destroyed then return end
             if ready then
                 pcall(function()
-                    if Global.PlayerCharacter ~= PC then
-                        refreshPC()
+                    if os.clock() >= nextSync or Global.PlayerCharacter ~= PC then
+                        nextSync = os.clock() + 2
+                        if Global.PlayerCharacter ~= PC then refreshPC() end
+                        if state.infiniteStamina or state.antiRagdoll or state.antiFallDamage or state.infiniteHorseStamina then CHAR.sync() end
+                        if not NetHooked and (state.infiniteStamina or state.antiRagdoll or state.antiFallDamage) then hookFireServer() end
                     end
-                    if state.infiniteStamina or state.antiRagdoll or state.antiFallDamage or state.infiniteHorseStamina then
-                        CHAR.sync()
-                    end
-                    if not NetHooked and (state.infiniteStamina or state.antiRagdoll or state.antiFallDamage) then
-                        hookFireServer()
-                    end
+                    if state.antiRagdoll then recoverRagdoll() end
                 end)
             end
         end
@@ -1828,8 +2133,8 @@ local function initCombat()
     local COMBAT_MAX_DISTANCE = 1000
     local VALID_PLAYER_PARTS = {"Head","UpperTorso","LowerTorso","LeftUpperArm","LeftLowerArm","RightUpperArm","RightLowerArm","LeftUpperLeg","LeftLowerLeg","RightUpperLeg","RightLowerLeg","LeftHand","RightHand","LeftFoot","RightFoot"}
     local PLAYER_FB = {Head={"Head","UpperTorso","LowerTorso"}, UpperTorso={"UpperTorso","LowerTorso","Head"}, LowerTorso={"LowerTorso","UpperTorso","Head"}}
-    local ANIMAL_FB = {Head={"Head","Body","Neck"}, UpperTorso={"Body","Head","Neck"}, LowerTorso={"Body","Head","LeftThigh","RightThigh"}}
-    local ANIMAL_KW = {"head","body","neck","leg","thigh","hoof","foot","arm","shoulder","paw"}
+    local ANIMAL_FB = {Head={"Head","Skull","Body","Neck"}, UpperTorso={"Body","Head","Skull","Neck"}, LowerTorso={"Body","Head","Skull","LeftThigh","RightThigh"}}
+    local ANIMAL_KW = {"head","skull","body","neck","leg","thigh","hoof","foot","arm","shoulder","paw"}
     local ANIMAL_EXCL = {"humanoidrootpart","eye","nose","snout","ear","antler","collision","hitbox"}
     local visParams = RaycastParams.new()
     visParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -1840,8 +2145,16 @@ local function initCombat()
         return false
     end
     local function getOwnMount()
-        local r = Global and Global.WildLife and Global.WildLife.RidingAnimal
-        if type(r) == "table" and r.hrp and typeof(r.hrp) == "Instance" then return r.hrp.Parent end
+        local wildlife = Global and Global.WildLife
+        local r = wildlife and wildlife.RidingAnimal
+        if wildlife and type(wildlife.GetRidingAnimal) == "function" then
+            local ok, riding = pcall(wildlife.GetRidingAnimal, wildlife)
+            if ok and riding then r = riding end
+        end
+        if type(r) == "table" then
+            if typeof(r.character) == "Instance" then return r.character end
+            if typeof(r.hrp) == "Instance" then return r.hrp.Parent end
+        end
         return nil
     end
     local function getOwnRep()
@@ -1851,31 +2164,39 @@ local function initCombat()
         if pf then return pf:FindFirstChild(S.LocalPlayer.Name) end
         return nil
     end
+    local function bodyPart(rig, name)
+        local part = rig:FindFirstChild(name) or rig:FindFirstChild(name, true)
+        if part and part:IsA("BasePart") and part:IsDescendantOf(S.Workspace) then return part end
+        return nil
+    end
     local function collectRigParts(rig, isAnimal)
         local parts = {}
         if not rig then return parts end
         if isAnimal then
-            for _, c in ipairs(rig:GetChildren()) do
-                if c:IsA("BasePart") and not nameMatches(c.Name, ANIMAL_EXCL) and nameMatches(c.Name, ANIMAL_KW) then
+            for _, c in ipairs(rig:GetDescendants()) do
+                local parent = c.Parent
+                local collisionPart = false
+                while parent and parent ~= rig do
+                    if nameMatches(parent.Name, {"collision", "hitbox"}) then collisionPart = true; break end
+                    parent = parent.Parent
+                end
+                if c:IsA("BasePart") and c:IsDescendantOf(S.Workspace) and not collisionPart
+                    and not nameMatches(c.Name, ANIMAL_EXCL) and nameMatches(c.Name, ANIMAL_KW) then
                     table.insert(parts, c)
                 end
             end
         else
             for _, n in ipairs(VALID_PLAYER_PARTS) do
-                local p = rig:FindFirstChild(n)
-                if p and p:IsA("BasePart") then table.insert(parts, p) end
+                local p = bodyPart(rig, n)
+                if p then table.insert(parts, p) end
             end
         end
         return parts
     end
     local function getNpcRig(folder)
-        local m = folder:FindFirstChild("Model")
-        if not m then return nil end
-        local h = m:FindFirstChildOfClass("Humanoid")
-        if not h or h.Health <= 0 then return nil end
-        local rp = m:FindFirstChild("HumanoidRootPart", true)
-        if not rp or not rp.Parent then return nil end
-        return rp.Parent
+        local rig = Adapter.resolveNPC(folder)
+        if rig and ESP.isAlive(rig) then return rig end
+        return nil
     end
     local function resolveAimPart(rig, isAnimal)
         if not rig then return nil end
@@ -1901,8 +2222,8 @@ local function initCombat()
         local chain = fb[choice]
         if not chain then return nil end
         for _, n in ipairs(chain) do
-            local p = rig:FindFirstChild(n)
-            if p and p:IsA("BasePart") then return p end
+            local p = bodyPart(rig, n)
+            if p then return p end
         end
         return nil
     end
@@ -1917,7 +2238,27 @@ local function initCombat()
         if not result then return true end
         return result.Instance:IsDescendantOf(model)
     end
+    COMBAT.getTargetVelocity = function(target)
+        local velocity = target.part.AssemblyLinearVelocity
+        if velocity and velocity.Magnitude >= 0.1 then return velocity end
+        local root = target.model and (target.model:FindFirstChild("HumanoidRootPart", true) or target.model:FindFirstChild("RootPart", true))
+        local rootVelocity = root and root.AssemblyLinearVelocity
+        if rootVelocity and rootVelocity.Magnitude >= 0.1 then return rootVelocity end
+        -- Interpolated NPC roots can be anchored: physics velocity is then zero.
+        local registry = Global and Global.ClientNPCs and Global.ClientNPCs.NPC_Map
+        local npc = target.kind == "NPC" and registry and registry[target.model]
+        if npc and npc.IsMoving == true and type(npc.ReplicatedMoveSpeed) == "number" then
+            local direction = npc.DirectionVector
+            local kind = typeof(direction)
+            local speed = npc.ReplicatedMoveSpeed
+            if (kind == "Vector3" or kind == "vector") and speed >= 0 and speed < math.huge then
+                return Vector3.new(direction.X, direction.Y, direction.Z) * speed
+            end
+        end
+        return rootVelocity or velocity
+    end
     COMBAT.getBestTarget = function(origin)
+        if state.destroyed then return nil end
         local Entities = S.Workspace:FindFirstChild("WORKSPACE_Entities")
         if not Entities then return nil end
         local camCF = S.Camera.CFrame
@@ -1938,21 +2279,11 @@ local function initCombat()
                 best = {model=model, part=part, kind=kind, name=name, dist=dist, angle=angle}
             end
         end
-        local function preFilter(model)
-            local r = model:FindFirstChild("HumanoidRootPart", true)
-            if not r then return false end
-            local toR = r.Position - camPos
-            local d = toR.Magnitude
-            if d < 2 or d > maxDist + 15 then return false end
-            local a = math.deg(math.acos(math.clamp(camLook:Dot(toR.Unit), -1, 1)))
-            if a > halfFov + 20 then return false end
-            return true
-        end
         if state.targetPlayers then
             local f = Entities:FindFirstChild("Players")
             if f then
                 for _, m in ipairs(f:GetChildren()) do
-                    if m.Name ~= S.LocalPlayer.Name and preFilter(m) then
+                    if m.Name ~= S.LocalPlayer.Name then
                         local h = m:FindFirstChildOfClass("Humanoid")
                         if h and h.Health > 0 then
                             evaluate(m, resolveAimPart(m, false), "Player", m.Name)
@@ -1966,11 +2297,19 @@ local function initCombat()
             local om = getOwnMount()
             if f then
                 for _, m in ipairs(f:GetChildren()) do
-                    if m ~= om and preFilter(m) then
-                        if state.showLegendaryOnly and not ESP.isLegendaryAnimal(m) then
-                        else
-                            evaluate(m, resolveAimPart(m, true), "Animal", m.Name)
+                    local available = m:IsA("Model") and m ~= om and ESP.isAlive(m)
+                    local health = m:FindFirstChild("Health")
+                    if health and (health:IsA("NumberValue") or health:IsA("IntValue")) and health.Value <= 0 then available = false end
+                    local wildlife = Global and Global.WildLife
+                    if available and wildlife and type(wildlife.GetWildLifeObject) == "function" then
+                        local ok, animal = pcall(wildlife.GetWildLifeObject, wildlife, m)
+                        if ok and type(animal) == "table" then
+                            if animal.Unloaded == true or (type(animal.Health) == "number" and animal.Health <= 0) then available = false end
                         end
+                    end
+                    if available then
+                        -- Target Animals includes horses and animal bosses; ESP filters are independent.
+                        evaluate(m, resolveAimPart(m, true), "Animal", m.Name)
                     end
                 end
             end
@@ -1979,9 +2318,9 @@ local function initCombat()
             local f = Entities:FindFirstChild("NPCs")
             if f then
                 for _, n in ipairs(f:GetChildren()) do
-                    if preFilter(n) then
-                        local rig = getNpcRig(n)
-                        if rig then evaluate(n, resolveAimPart(rig, false), "NPC", n.Name) end
+                    local rig = getNpcRig(n)
+                    if rig then
+                        evaluate(rig, resolveAimPart(rig, false), "NPC", n.Name)
                     end
                 end
             end
@@ -2025,17 +2364,7 @@ local function initHooks()
                     -- ============ MOVEMENT PREDICTION ============
                     if state.silentAimPrediction and (state.silentAimPredictionStrength or 0) > 0 then
                         -- 1. Target velocity (part first, then root fallback)
-                        local tVel = target.part.AssemblyLinearVelocity
-                        if (not tVel) or tVel.Magnitude < 0.1 then
-                            local root
-                            if target.model then
-                                root = target.model:FindFirstChild("HumanoidRootPart")
-                                    or target.model:FindFirstChild("RootPart")
-                            end
-                            if root and root.AssemblyLinearVelocity then
-                                tVel = root.AssemblyLinearVelocity
-                            end
-                        end
+                        local tVel = COMBAT.getTargetVelocity(target)
 
                         if tVel then
                             -- 2. Estimate projectile speed
@@ -2085,6 +2414,7 @@ local function initHooks()
                 end
             end
             if state.noSpread then
+                if type(sharedData) == "table" then sharedData = table.clone(sharedData) end
                 if not redirected then
                     params.direction = S.Camera.CFrame.LookVector
                 end
@@ -2112,6 +2442,84 @@ local function initHooks()
         return oldInitProjectiles(self, projType, sharedData, params, callback)
     end
 
+    local wandClass, oldWandCast
+    local Utils = Global and Global.Utils
+    local oldMouseHit = Utils and Utils.GetMouseHit
+    local wandContexts = setmetatable({}, {__mode="k"})
+    local function wandMouseHitHook(...)
+        local context = wandContexts[coroutine.running()]
+        if not installed or not context or state.destroyed or not state.silentAim or context.item.Owner ~= true then
+            return oldMouseHit(...)
+        end
+        local ok, aim = pcall(function()
+            local pc = Global.PlayerCharacter
+            local item = context.item
+            local model = item.Model
+            local primary = model and model.PrimaryPart
+            local castFrom = primary and primary:FindFirstChild("CastFrom")
+            local projectiles = Global.SharedProjectiles
+            if not pc or not pc.RootPart or not castFrom or not projectiles
+                or type(projectiles.ResolveProjectileOrigin) ~= "function" then return nil end
+            local origin = projectiles.ResolveProjectileOrigin(pc.RootPart.Position, castFrom.WorldPosition)
+            local target = COMBAT.getBestTarget(origin)
+            if not target or not target.part or not target.part:IsDescendantOf(S.Workspace) then return nil end
+            local spells = Global.WandUtils and Global.WandUtils.Spells
+            local spell = spells and spells[context.spell]
+            local settings = spell and spell.Settings
+            if not settings or type(settings.Speed) ~= "number" or settings.Speed <= 0 or settings.Speed >= math.huge then return nil end
+            local charge = type(item.GetChargeAlpha) == "function" and item:GetChargeAlpha() or 0
+            if type(charge) ~= "number" or charge ~= charge then charge = 0 end
+            local speed = settings.Speed * (1 + math.clamp(charge, 0, 1) * 0.5)
+            local position = target.part.Position
+            local aimPosition = position
+            local velocity
+            if state.silentAimPrediction and (state.silentAimPredictionStrength or 0) > 0 then
+                velocity = COMBAT.getTargetVelocity(target)
+                if typeof(velocity) ~= "Vector3" then velocity = nil end
+            end
+            local gravity = type(settings.Gravity) == "number" and settings.Gravity or 0
+            if gravity ~= gravity or math.abs(gravity) >= math.huge then gravity = 0 end
+            -- Match the native charge-dependent speed and positionAt gravity used by WandUtils.
+            for _ = 1, 3 do
+                local flightTime = (aimPosition - origin).Magnitude / speed
+                aimPosition = position + Vector3.new(0, gravity * flightTime * flightTime * 0.5, 0)
+                if velocity then aimPosition += velocity * (flightTime * state.silentAimPredictionStrength) end
+            end
+            if (aimPosition - origin).Magnitude <= 0.01 then return nil end
+            return aimPosition
+        end)
+        if ok and aim then return aim end
+        return oldMouseHit(...)
+    end
+    local function wandCastHook(self, spellName, ...)
+        if not installed or state.destroyed or not state.silentAim then
+            return oldWandCast(self, spellName, ...)
+        end
+        local thread = coroutine.running()
+        local previous = wandContexts[thread]
+        wandContexts[thread] = self.Owner == true and {item=self,spell=spellName} or nil
+        local values = table.pack(pcall(oldWandCast, self, spellName, ...))
+        wandContexts[thread] = installed and previous or nil
+        if not values[1] then error(values[2], 0) end
+        return table.unpack(values, 2, values.n)
+    end
+    local function installWandAim()
+        if not Utils then Utils = Global and Global.Utils; oldMouseHit = Utils and Utils.GetMouseHit end
+        if not wandClass then
+            local ok, result = pcall(function() return Global:LoadModule("WandItem") end)
+            if ok and type(result) == "table" then wandClass = result; oldWandCast = result.Cast end
+        end
+        if wandClass and type(oldWandCast) == "function" and Utils and type(oldMouseHit) == "function" then
+            Utils.GetMouseHit = wandMouseHitHook
+            wandClass.Cast = wandCastHook
+        end
+    end
+    local function removeWandAim()
+        if wandClass and wandClass.Cast == wandCastHook then wandClass.Cast = oldWandCast end
+        if Utils and Utils.GetMouseHit == wandMouseHitHook then Utils.GetMouseHit = oldMouseHit end
+        table.clear(wandContexts)
+    end
+
     HOOKS.install = function()
         if installed then return end
         installed = true
@@ -2122,11 +2530,13 @@ local function initHooks()
         if ProjectileHandler then
             ProjectileHandler.InitProjectiles = initProjectilesHook
         end
+        installWandAim()
         HOOKS.applyNoRecoil(state.noRecoil)
     end
     HOOKS.uninstall = function()
         if not installed then return end
         installed = false
+        removeWandAim()
         if ProjectileHandler then
             ProjectileHandler.InitProjectiles = oldInitProjectiles
         end
@@ -2143,6 +2553,11 @@ local function initAmmo()
     local wrappedClasses = setmetatable({}, {__mode="k"})
     local wrappedInstances = setmetatable({}, {__mode="k"})
     local installed = false
+    local classRestores, instanceRestores = {}, setmetatable({}, {__mode="k"})
+    local function replaceMethod(class, key, original, hook)
+        table.insert(classRestores, {class=class,key=key,original=original,hook=hook})
+        class[key] = hook
+    end
     local function isWeapon(t)
         if type(t) ~= "table" then return false end
         if rawget(t, "Ammo") == nil and rawget(t, "MaxAmmo") == nil then
@@ -2220,7 +2635,8 @@ local function initAmmo()
         wrappedInstances[inst] = true
         local mt = getmetatable(inst)
         if type(mt) == "table" and mt.__TWW_AMMO_PROXY then return end
-        pcall(function() setmetatable(inst, makeMT(mt)) end)
+        local proxy = makeMT(mt)
+        if pcall(function() setmetatable(inst, proxy) end) then instanceRestores[inst] = {original=mt,proxy=proxy} end
     end
     local function findExisting()
         if type(getgc) ~= "function" then return end
@@ -2241,7 +2657,7 @@ local function initAmmo()
                 return inst
             end
             ourHooks[newHook] = true
-            cls.new = newHook
+            replaceMethod(cls, "new", origNew, newHook)
         end
         for _, mName in ipairs({"Update", "ReplicatedUpdate"}) do
             local orig = cls[mName]
@@ -2252,7 +2668,7 @@ local function initAmmo()
                     return r
                 end
                 ourHooks[hook] = true
-                cls[mName] = hook
+                replaceMethod(cls, mName, orig, hook)
             end
         end
         local origLoad = cls.Load
@@ -2262,9 +2678,52 @@ local function initAmmo()
                 return origLoad(self, ...)
             end
             ourHooks[hook] = true
-            cls.Load = hook
+            replaceMethod(cls, "Load", origLoad, hook)
         end
     end
+    local function wrapWandClass(cls)
+        if type(cls) ~= "table" or wrappedClasses[cls] then return end
+        wrappedClasses[cls] = true
+        local canCast, chargeAlpha = cls.CanCast, cls.GetChargeAlpha
+        if type(canCast) == "function" then
+            replaceMethod(cls, "CanCast", canCast, function(self, spellName, ...)
+                local values = table.pack(canCast(self, spellName, ...))
+                if values[1] or not state.infiniteAmmo or state.destroyed or self.Owner ~= true then
+                    return table.unpack(values, 1, values.n)
+                end
+                local spells = Global.WandUtils and Global.WandUtils.Spells
+                local spell = spells and spells[spellName]
+                local settings = spell and spell.Settings
+                local replicated = Global.ReplicatedState and Global.ReplicatedState.State
+                local mana = replicated and replicated.Mana
+                -- Only remove the verified mana denial; keep aim, action and cooldown eligibility.
+                if type(settings) == "table" and type(settings.ManaCost) == "number"
+                    and type(mana) == "number" and mana < settings.ManaCost
+                    and self.IsAiming and not self.ActionRunning
+                    and not (self.CastEnd and os.clock() < self.CastEnd) then
+                    return true
+                end
+                return table.unpack(values, 1, values.n)
+            end)
+        end
+        if type(chargeAlpha) == "function" then
+            replaceMethod(cls, "GetChargeAlpha", chargeAlpha, function(self, ...)
+                if state.infiniteAmmo and not state.destroyed and self.Owner == true and self.ChargingNow then
+                    local spells = Global.WandUtils and Global.WandUtils.Spells
+                    local spell = spells and spells[self.SpellName]
+                    local settings = spell and spell.Settings
+                    local replicated = Global.ReplicatedState and Global.ReplicatedState.State
+                    local mana = replicated and replicated.Mana
+                    if type(settings) == "table" and type(settings.ManaCost) == "number"
+                        and type(mana) == "number" and mana <= settings.ManaCost * 2 then
+                        return math.min((os.clock() - self.ChargingNow) / 0.75, 1)
+                    end
+                end
+                return chargeAlpha(self, ...)
+            end)
+        end
+    end
+
     AMMO.install = function()
         if installed then return true end
         if not Global then return false end
@@ -2273,12 +2732,24 @@ local function initAmmo()
                 local ok2, cls = pcall(function() return Global:LoadModule(name) end)
                 if ok2 then wrapClass(cls) end
             end
+            local wandOk, wand = pcall(function() return Global:LoadModule("WandItem") end)
+            if wandOk then wrapWandClass(wand) end
         end)
         pcall(findExisting)
         installed = ok
         return ok
     end
     AMMO.uninstall = function()
+        for i = #classRestores, 1, -1 do
+            local record = classRestores[i]
+            if record.class[record.key] == record.hook then record.class[record.key] = record.original end
+        end
+        table.clear(classRestores)
+        for instance, record in pairs(instanceRestores) do
+            if getmetatable(instance) == record.proxy then pcall(setmetatable, instance, record.original) end
+        end
+        table.clear(instanceRestores)
+        wrappedInstances = setmetatable({}, {__mode="k"})
         wrappedClasses = setmetatable({}, {__mode="k"})
         installed = false
     end
@@ -2289,6 +2760,10 @@ end
 --  INVENTORY
 -- =================================================================
 local function initInventory()
+    local activePrompt
+    INV.stop = function()
+        if activePrompt then pcall(function() activePrompt:InputHoldEnd() end); activePrompt = nil end
+    end
     local function findBankVault()
         local tagged = S.CollectionService:GetTagged("BankVault")
         if tagged and #tagged > 0 then return tagged[1] end
@@ -2304,9 +2779,21 @@ local function initInventory()
         if not v then return false, "No BankVault found" end
         local prompt = v:FindFirstChildWhichIsA("ProximityPrompt", true)
         if not prompt then return false, "No ProximityPrompt on BankVault" end
-        pcall(function() prompt:InputHoldBegin() end)
+        if not prompt.Enabled then return false, "The nearby vault prompt is disabled" end
+        local attachment = prompt.Parent
+        local point = attachment and attachment:IsA("Attachment") and attachment.WorldPosition
+            or (attachment and attachment:IsA("BasePart") and attachment.Position)
+        local character = Global and Global.PlayerCharacter and Global.PlayerCharacter.Character or S.LocalPlayer.Character
+        local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+        if not point or not root or (root.Position - point).Magnitude > prompt.MaxActivationDistance then
+            return false, "Move within the vault prompt's activation distance first"
+        end
+        INV.stop()
+        local ok, err = pcall(function() prompt:InputHoldBegin() end)
+        if not ok then return false, tostring(err) end
+        activePrompt = prompt
         task.delay((prompt.HoldDuration or 0) + 0.15, function()
-            pcall(function() prompt:InputHoldEnd() end)
+            if activePrompt == prompt then INV.stop() end
         end)
         return true
     end
@@ -2322,111 +2809,18 @@ local function initWendigoAnnouncer()
         return obj and obj.Name and obj.Name:lower() == "wendigo"
     end
 
-    local function playAlertSound(parent)
-        pcall(function()
-            local snd = Instance.new("Sound")
-            snd.Name = "TWW_WendigoAlert"
-            snd.SoundId = "rbxassetid://6042053626"
-            snd.Volume = 2
-            snd.Parent = parent
-            snd:Play()
-            task.delay(6, function() pcall(function() snd:Destroy() end) end)
-        end)
-    end
-
+    local lastAlert = -math.huge
     local function announce()
-        local playerGui = S.LocalPlayer:FindFirstChildOfClass("PlayerGui")
-        if not playerGui then return end
-
-        local old = playerGui:FindFirstChild("TWW_WendigoAnnounce")
-        if old then pcall(function() old:Destroy() end) end
-
-        local gui = Instance.new("ScreenGui")
-        gui.Name = "TWW_WendigoAnnounce"
-        gui.ResetOnSpawn = false
-        gui.IgnoreGuiInset = true
-        gui.DisplayOrder = 99999
-        gui.Parent = playerGui
-
-        local bg = Instance.new("Frame")
-        bg.Size = UDim2.fromScale(1, 1)
-        bg.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-        bg.BackgroundTransparency = 1
-        bg.BorderSizePixel = 0
-        bg.Parent = gui
-
-        local banner = Instance.new("Frame")
-        banner.Size = UDim2.new(1, 0, 0, 170)
-        banner.Position = UDim2.new(0, 0, 0.5, -400)
-        banner.BackgroundColor3 = Color3.fromRGB(120, 0, 0)
-        banner.BackgroundTransparency = 0.5
-        banner.BorderSizePixel = 0
-        banner.Parent = gui
-
-        local stroke = Instance.new("UIStroke")
-        stroke.Color = Color3.fromRGB(255, 60, 60)
-        stroke.Thickness = 5
-        stroke.Parent = banner
-
-        local title = Instance.new("TextLabel")
-        title.Size = UDim2.fromScale(1, 1)
-        title.BackgroundTransparency = 1
-        title.TextColor3 = Color3.fromRGB(255, 240, 240)
-        title.Font = Enum.Font.GothamBlack
-        title.TextScaled = true
-        title.Text = "⚠ WENDIGO SE SPAWNUL ⚠"
-        title.Parent = banner
-
-        local sizeConst = Instance.new("UITextSizeConstraint")
-        sizeConst.MaxTextSize = 100
-        sizeConst.MinTextSize = 28
-        sizeConst.Parent = title
-
-        local sub = Instance.new("TextLabel")
-        sub.Size = UDim2.new(1, 0, 0, 28)
-        sub.Position = UDim2.new(0, 0, 1, -30)
-        sub.BackgroundTransparency = 1
-        sub.TextColor3 = Color3.fromRGB(255, 200, 200)
-        sub.Font = Enum.Font.GothamBold
-        sub.TextSize = 20
-        sub.Text = "Legendary Animal detekován v Animals"
-        sub.Parent = banner
-
-        playAlertSound(gui)
-
-        S.TweenService:Create(bg, TweenInfo.new(0.3), {BackgroundTransparency = 0.35}):Play()
-        S.TweenService:Create(banner, TweenInfo.new(0.45, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
-            Position = UDim2.new(0, 0, 0.5, -85),
-            BackgroundTransparency = 0,
-        }):Play()
-
-        task.spawn(function()
-            for _ = 1, 4 do
-                S.TweenService:Create(title, TweenInfo.new(0.18), {TextColor3 = Color3.fromRGB(255, 90, 90)}):Play()
-                task.wait(0.18)
-                S.TweenService:Create(title, TweenInfo.new(0.18), {TextColor3 = Color3.fromRGB(255, 240, 240)}):Play()
-                task.wait(0.18)
-            end
-        end)
-
-        task.delay(6, function()
-            S.TweenService:Create(banner, TweenInfo.new(0.45, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
-                Position = UDim2.new(0, 0, 0.5, -400),
-                BackgroundTransparency = 1,
-            }):Play()
-            S.TweenService:Create(bg, TweenInfo.new(0.4), {BackgroundTransparency = 1}):Play()
-            task.wait(0.6)
-            if gui.Parent then pcall(function() gui:Destroy() end) end
-        end)
-
-        if state.window and state.window.Notify then
-            pcall(function() state.window:Notify("WENDIGO SPAWN!", 5) end)
+        if state.destroyed or os.clock() - lastAlert < 3 then return end
+        lastAlert = os.clock()
+        if state.window then
+            pcall(function() state.window:Notify("🦌 WENDIGO SPAWNED — check animal ESP for its location.", 6) end)
         end
     end
 
     local function watchFolder(folder)
         if not folder then return end
-        folder.ChildAdded:Connect(function(child)
+        connect(folder.ChildAdded, function(child)
             if state.destroyed then return end
             if child:IsA("Model") and isWendigoExact(child) then
                 announce()
@@ -2439,8 +2833,14 @@ local function initWendigoAnnouncer()
     task.spawn(function()
         local node = S.Workspace
         for segment in string.gmatch(ANIMALS_PATH, "[^.]+") do
-            node = node:WaitForChild(segment, 120)
-            if not node then return end
+            local deadline = os.clock() + 15
+            local child = node:FindFirstChild(segment)
+            while not child and not state.destroyed and os.clock() < deadline do
+                task.wait(0.1)
+                child = node:FindFirstChild(segment)
+            end
+            if state.destroyed or not child then return end
+            node = child
         end
         watchFolder(node)
         for _, child in ipairs(node:GetChildren()) do
@@ -2453,38 +2853,33 @@ end
 --  UI
 -- =================================================================
 local function initUI()
-    local Window = Library:CreateWindow("TWW Ultimate ESP + Combat", {
-        Width = 640, Height = 560,
+    local viewport = S.Camera and S.Camera.ViewportSize or Vector2.new(1280,720)
+    local Window = Library:CreateWindow("🤠 TWW | SmugLibV2", {
+        Width = math.max(240, math.min(720, viewport.X - 40)),
+        Height = math.max(220, math.min(640, viewport.Y - 40)),
         ToggleKey = Enum.KeyCode.RightShift,
         ConfigKey = "TWW_Ultimate_V3",
         ConfigAutoSave = false,
         OnClose = function()
-            pcall(function()
-                state.espEnabled = false
-                if ESP.cleanup then ESP.cleanup() end
-                state.silentAim = false
-                state.noSpread = false
-                if HOOKS.applyNoRecoil then HOOKS.applyNoRecoil(false) end
-                if HOOKS.uninstall then HOOKS.uninstall() end
-                if FB.stop then pcall(FB.stop) end
-                if Physics and Physics.stop then pcall(Physics.stop) end
-                pcall(function() S.Lighting.ExposureCompensation = 0 end)
+            if not state.destroyed then
                 SaveStateToConfig(state.currentConfig)
-            end)
+                if destroyRuntime then destroyRuntime() end
+            end
         end,
     })
     state.window = Window
     local function toast(msg, dur) pcall(function() Window:Notify(msg, dur or 2) end) end
 
-    local MainTab      = Window:Folder("Main")
-    local VisualsTab   = Window:Folder("Visuals")
-    local CombatTab    = Window:Folder("Combat")
-    local UtilitiesTab = Window:Folder("Utilities")
-    local ConfigTab    = Window:Folder("Config")
+    local MainTab      = Window:Folder("🏠 Main")
+    local VisualsTab   = Window:Folder("🎨 Visuals")
+    local CombatTab    = Window:Folder("🎯 Combat")
+    local UtilitiesTab = Window:Folder("🧍 Player")
+    local ConfigTab    = Window:Folder("⚙️ Config")
 
     -- ================== MAIN ==================
-    local master = MainTab:Section("⚡ Master Controls")
-    uiHandles.checkboxes.espEnabled = master:Checkbox("Enable ESP", function(enabled)
+    local master = MainTab:Section("⚡ Quick Controls")
+    master:Label("Choose your ESP targets below. RightShift toggles this menu; J toggles Silent Aim.")
+    uiHandles.checkboxes.espEnabled = master:Checkbox("👁️ Enable ESP", function(enabled)
         if _loadingConfig then return end
         state.espEnabled = enabled
         ESP.lastUpdate = 0
@@ -2493,41 +2888,52 @@ local function initUI()
         end
     end, state.espEnabled)
 
-    uiHandles.checkboxes.suppressErrors = master:Checkbox("🚫 Suppress Errors / Warnings", function(e)
-        if _loadingConfig then return end
-        state.suppressErrors = e
-    end, state.suppressErrors)
+    master:Button("🔄 Refresh Targets", function()
+        if ESP.refresh then ESP.refresh() end
+        ESP.lastUpdate = 0
+        toast("Loaded targets refreshed.", 2)
+    end)
+    master:Button("🛑 Stop All Features", function()
+        if stopAll then stopAll() end
+        toast("All features stopped.", 2)
+    end)
 
-    local entSec = MainTab:Section("🧩 Entities")
-    local function entToggle(label, key)
-        uiHandles.checkboxes[key] = entSec:Checkbox(label, function(e)
+    local function entToggle(section, label, key)
+        uiHandles.checkboxes[key] = section:Checkbox(label, function(enabled)
             if _loadingConfig then return end
-            state[key] = e
+            state[key] = enabled
+            ESP.lastUpdate = 0
         end, state[key])
     end
-    entToggle("Players", "showPlayers")
-    entToggle("NPCs", "showNPCs")
-    entToggle("Animals", "showAnimals")
-    entToggle("Horses", "showHorses")
-    entToggle("Fish", "showFish")
-    entToggle("Dead Animals", "showDeadAnimals")
-    entToggle("Ores", "showOres")
-    entToggle("Items", "showItems")
-    entToggle("Chests", "showChests")
-    entToggle("Trains", "showTrains")
-    entToggle("Territories", "showTerritories")
-    entToggle("Thunderstruck Trees/Cacti ⚡", "showThunderstruck")
+    local people = MainTab:Section("👥 People")
+    entToggle(people, "👤 Players", "showPlayers")
+    entToggle(people, "🤖 NPCs & Bosses", "showNPCs")
 
-    uiHandles.checkboxes.highlightGoldBars = entSec:Checkbox("Bank Gold Bars (GoldBar)", function(e)
-        if _loadingConfig then return end
-        state.highlightGoldBars = e
-    end, state.highlightGoldBars)
+    local resources = MainTab:Section("💎 Resources & Loot")
+    entToggle(resources, "⛏️ Ore Deposits", "showOres")
+    entToggle(resources, "📦 Dropped Items", "showItems")
+    entToggle(resources, "🧰 Treasure Chests", "showChests")
+    entToggle(resources, "🌿 Available Plants", "showPlants")
 
-    local goldStatusLabel = entSec:Label("💰 Bank Gold Bars: ⏳ scanning...")
+    local wildlife = MainTab:Section("🦌 Wildlife")
+    entToggle(wildlife, "🐾 Animals", "showAnimals")
+    entToggle(wildlife, "🐎 Horses", "showHorses")
+    entToggle(wildlife, "🐟 Fish", "showFish")
+    entToggle(wildlife, "🦴 Animal Remains", "showDeadAnimals")
+
+    local world = MainTab:Section("🧭 World")
+    entToggle(world, "🚂 Trains", "showTrains")
+    entToggle(world, "🚩 Territories", "showTerritories")
+    entToggle(world, "⚡ Thunderstruck Trees & Cacti", "showThunderstruck")
+
+    local bankSec = MainTab:Section("🏦 Bank")
+    entToggle(bankSec, "💰 Gold Bars", "highlightGoldBars")
+    local goldStatusLabel = bankSec:Label("💰 Bank Gold Bars: ⏳ scanning...")
     task.spawn(function()
         local last = ""
         while not state.destroyed do
             task.wait(1)
+            if state.destroyed then return end
             local exists, count = false, 0
             if ESP.getGoldBarStatus then
                 local ok, e, c = pcall(ESP.getGoldBarStatus)
@@ -2535,11 +2941,11 @@ local function initUI()
             end
             local text
             if not exists then
-                text = "💰 Bank Gold Bars: ❌ nenalezeny (bank neni nactena)"
+                text = "💰 Bank Gold Bars: ❌ not found in the loaded area"
             elseif count == 0 then
-                text = "💰 Bank Gold Bars: ⚠️ nalezeny, ale 0 cihel"
+                text = "💰 Bank Gold Bars: ⚠️ loaded, but no gold bars available"
             else
-                text = "💰 Bank Gold Bars: ✅ " .. count .. " cihel"
+                text = "💰 Bank Gold Bars: ✅ " .. count .. " gold bars"
             end
             if text ~= last and goldStatusLabel then
                 last = text
@@ -2552,16 +2958,394 @@ local function initUI()
         end
     end)
 
-    local bankSec = MainTab:Section("💼 Bank")
-    bankSec:Label("Open Bank Anywhere — triggers BankVault's ProximityPrompt.")
-    bankSec:Button("🏦 Open Bank (Anywhere)", function()
+    bankSec:Label("Move near a vault to use its interaction.")
+    bankSec:Button("🏦 Open Nearby Bank Vault", function()
         local ok, err = INV.openBankAnywhere()
-        if ok then toast("Bank prompt triggered.", 2)
+        if ok then toast("Vault interaction started. Check the bank UI for confirmation.", 3)
         else toast("Bank failed: "..tostring(err), 3) end
     end)
 
-    local utilSec = MainTab:Section("🔧 Utilities")
-    utilSec:Button("Server Hop", function()
+    -- ================== VISUALS ==================
+    local infoSec = VisualsTab:Section("🏷️ Labels & Tracers")
+    local function dispToggle(label, key)
+        uiHandles.checkboxes[key] = infoSec:Checkbox(label, function(e)
+            if _loadingConfig then return end
+            state[key] = e
+        end, state[key])
+    end
+    dispToggle("🏷️ Names", "showNames")
+    dispToggle("📏 Distance", "showDistance")
+    dispToggle("❤️ Health", "showHealth")
+    dispToggle("〰️ Tracers", "showTracers")
+    local bodySec = VisualsTab:Section("✨ Body Highlights")
+    bodySec:Label("Choose the body groups to emphasize. Legendary animals keep their gold highlight.")
+    uiHandles.checkboxes.chamsEnabled = bodySec:Checkbox("✨ Enable Body Highlights", function(e)
+        if _loadingConfig then return end
+        state.chamsEnabled = e
+        if e then
+            if ESP.clearAllChams then ESP.clearAllChams() end
+        end
+    end, state.chamsEnabled)
+
+    uiHandles.checklists.espBodyHighlight = bodySec:Checklist("🎯 Body Parts",
+        BODY_HIGHLIGHT_OPTIONS,
+        function(list)
+            if _loadingConfig then return end
+            state.espBodyHighlight = list or {}
+        end, state.espBodyHighlight or {})
+
+    bodySec:Button("🔄 Reset Highlights", function()
+        if ESP.resetHighlights then
+            ESP.resetHighlights()
+            toast("Rebuilding highlights one by one...", 2)
+        end
+    end)
+
+    -- ================== ANIMAL FILTER ==================
+    local animalSec = VisualsTab:Section("🦌 Animal Filters")
+    uiHandles.checkboxes.showLegendaryOnly = animalSec:Checkbox("⭐ Legendary Animals Only", function(enabled)
+        if not _loadingConfig then state.showLegendaryOnly = enabled end
+    end, state.showLegendaryOnly)
+    uiHandles.checkboxes.legendaryGoldenMode = animalSec:Checkbox("✨ Gold Legendary Highlight", function(enabled)
+        if not _loadingConfig then state.legendaryGoldenMode = enabled end
+    end, state.legendaryGoldenMode)
+    animalSec:Label("Empty selection shows all species. Legendary animals bypass this species list.")
+
+    local animalChecklist = nil
+    local function rebuildAnimalChecklist()
+        local names = (ESP.collectAnimalNames and ESP.collectAnimalNames()) or {}
+        if #names == 0 then names = {"(no animals found in the loaded area)"} end
+        if animalChecklist then
+            animalChecklist:SetOptions(names)
+            animalChecklist:SetSelected(state.animalFilter or {})
+            return
+        end
+        animalChecklist = animalSec:Checklist("🐾 Visible Species", names,
+            function(list)
+                if _loadingConfig then return end
+                state.animalFilter = list or {}
+            end, state.animalFilter or {})
+        uiHandles.checklists.animalFilter = animalChecklist
+    end
+    rebuildAnimalChecklist()
+
+    animalSec:Button("🔄 Refresh Animal List", function()
+        rebuildAnimalChecklist()
+        toast("Animal list refreshed ("..#(state.animalFilter or {}).." selected)", 2)
+    end)
+    animalSec:Button("✅ Select All Species", function()
+        local names = (ESP.collectAnimalNames and ESP.collectAnimalNames()) or {}
+        state.animalFilter = names
+        if animalChecklist then
+            pcall(function() animalChecklist:SetSelected(names) end)
+        end
+        toast("All animal species selected.", 2)
+    end)
+    animalSec:Button("🧹 Clear Species Filter", function()
+        state.animalFilter = {}
+        if animalChecklist then
+            pcall(function() animalChecklist:SetSelected({}) end)
+        end
+        toast("Filter cleared — showing all animal species.", 2)
+    end)
+
+    task.spawn(function()
+        task.wait(4)
+        pcall(function()
+            if not state.destroyed then rebuildAnimalChecklist() end
+        end)
+    end)
+
+    local colorSec = VisualsTab:Section("🎨 Category Colors")
+    local function colorDD(label, key)
+        uiHandles.dropdowns[key] = colorSec:Dropdown(label, COLOR_OPTIONS, function(v)
+            if _loadingConfig then return end
+            state[key] = v
+        end, state[key])
+    end
+    for _, pair in ipairs({
+        {"Player","playerColor"},{"NPC","npcColor"},{"Animal","animalColor"},{"Horse","horseColor"},
+        {"Ore","oreColor"},{"Item","itemColor"},{"Chest","chestColor"},{"Train","trainColor"},
+        {"Territory","territoryColor"},{"Fish","fishColor"},{"Dead Animal","deadAnimalColor"},
+        {"Thunderstruck","thunderstruckColor"},
+        {"Legendary Highlight","legendaryColor"},{"Tracer","tracerColor"},
+    }) do colorDD(pair[1], pair[2]) end
+
+    local oreSec = VisualsTab:Section("⛏️ Ore Details")
+    uiHandles.checkboxes.showOreCount = oreSec:Checkbox("🔢 Remaining Ore", function(enabled)
+        if not _loadingConfig then state.showOreCount = enabled end
+    end, state.showOreCount)
+    uiHandles.checkboxes.showOreTier = oreSec:Checkbox("💎 Ore Tier", function(enabled)
+        if not _loadingConfig then state.showOreTier = enabled end
+    end, state.showOreTier)
+
+    local perfSec = VisualsTab:Section("📐 Range & Display")
+    uiHandles.sliders.maxDistance = perfSec:Slider("📏 ESP Range (0 = Unlimited)", 0, 5000, state.maxDistance,
+        function(v) if _loadingConfig then return end state.maxDistance = v end, 10)
+    uiHandles.sliders.updateInterval = perfSec:Slider("⏱️ Refresh Interval (seconds)", 0.05, 1, state.updateInterval,
+        function(v) if _loadingConfig then return end state.updateInterval = v end, 0.05)
+    uiHandles.sliders.labelSize = perfSec:Slider("🔠 Label Size", 10, 20, state.labelSize, function(v)
+        if _loadingConfig then return end
+        state.labelSize = v
+        ESP.setLabelSize(v)
+    end, 1)
+    uiHandles.sliders.tracerThickness = perfSec:Slider("〰️ Tracer Width", 1, 5, state.tracerThickness,
+        function(v) if _loadingConfig then return end state.tracerThickness = v end, 1)
+    uiHandles.sliders.tracerTransparency = perfSec:Slider("👻 Tracer Transparency", 0, 1, state.tracerTransparency,
+        function(v) if _loadingConfig then return end state.tracerTransparency = v end, 0.05)
+
+    -- ================== COMBAT ==================
+    local aimCombatSec = CombatTab:Section("🎯 Silent Aim")
+    local silentAimBox = aimCombatSec:Checkbox("🎯 Enable Silent Aim", function(e)
+        if _loadingConfig then return end
+        state.silentAim = e
+        if e and HOOKS.install then HOOKS.install() end
+        ESP.updateFOV()
+    end, state.silentAim)
+    uiHandles.checkboxes.silentAim = silentAimBox
+    pcall(function()
+        aimCombatSec:Bind("⌨️ Silent Aim Key", Enum.KeyCode.J, function()
+            state.silentAim = not state.silentAim
+            if state.silentAim and HOOKS.install then HOOKS.install() end
+            pcall(function() silentAimBox:Set(state.silentAim) end)
+            ESP.updateFOV()
+            toast("Silent Aim "..(state.silentAim and "ON" or "OFF"), 2)
+        end)
+    end)
+
+    uiHandles.dropdowns.targetPart = aimCombatSec:Dropdown("🎯 Aim Point",
+        {"Head","UpperTorso","LowerTorso","Random","Closest"},
+        function(v) if _loadingConfig then return end state.targetPart = v end, state.targetPart)
+    aimCombatSec:Label("Choose an aim point and enable the target groups you want below.")
+
+    local tgtSec = CombatTab:Section("🎯 Target Groups")
+    local function ctToggle(label, key)
+        uiHandles.checkboxes[key] = tgtSec:Checkbox(label, function(e)
+            if _loadingConfig then return end
+            state[key] = e
+        end, state[key])
+    end
+    ctToggle("👤 Target Players", "targetPlayers")
+    ctToggle("🐎 Target Animals & Horses", "targetAnimals")
+    ctToggle("🤖 Target NPCs & Bosses", "targetNPCs")
+    tgtSec:Label("Horses and bosses are included. Your ridden mount is always excluded.")
+    tgtSec:Label("Visual filters do not restrict combat targets.")
+
+    local aimingSec = CombatTab:Section("📐 Aim & Visibility")
+    uiHandles.sliders.fov = aimingSec:Slider("📐 Aim Cone (degrees)", 5, 180, state.fov, function(v)
+        if _loadingConfig then return end
+        state.fov = v
+        ESP.updateFOV()
+    end, 5)
+    uiHandles.checkboxes.visibilityCheck = aimingSec:Checkbox("🧱 Require Line of Sight", function(e)
+        if _loadingConfig then return end
+        state.visibilityCheck = e
+    end, state.visibilityCheck)
+    uiHandles.checkboxes.showFOVRing = aimingSec:Checkbox("⭕ Show Aim Circle", function(e)
+        if _loadingConfig then return end
+        state.showFOVRing = e
+        ESP.updateFOV()
+    end, state.showFOVRing)
+
+    -- ==== Movement Prediction (NEW) ====
+    local predSec = CombatTab:Section("🏹 Movement Prediction")
+    uiHandles.checkboxes.silentAimPrediction = predSec:Checkbox(
+        "🏹 Lead Moving Targets", function(e)
+            if _loadingConfig then return end
+            state.silentAimPrediction = e
+        end, state.silentAimPrediction)
+
+    uiHandles.sliders.silentAimPredictionStrength = predSec:Slider(
+        "📈 Lead Strength (0–2)", 0, 2, state.silentAimPredictionStrength,
+        function(v)
+            if _loadingConfig then return end
+            state.silentAimPredictionStrength = v
+        end, 0.05)
+
+    predSec:Label("0 = no lead · 1 = standard lead · above 1 = extra lead.")
+
+    local gunSec = CombatTab:Section("🔫 Weapon Controls")
+    uiHandles.checkboxes.noRecoil = gunSec:Checkbox("🎯 No Recoil", function(e)
+        if _loadingConfig then return end
+        state.noRecoil = e
+        if e and HOOKS.install then HOOKS.install() end
+        HOOKS.applyNoRecoil(e)
+    end, state.noRecoil)
+    uiHandles.checkboxes.noSpread = gunSec:Checkbox("✨ No Spread", function(e)
+        if _loadingConfig then return end
+        state.noSpread = e
+        if e and HOOKS.install then HOOKS.install() end
+    end, state.noSpread)
+
+    local ammoSec = gunSec
+    uiHandles.checkboxes.infiniteAmmo = ammoSec:Checkbox("♾️ Infinite Ammo / Wand Mana", function(e)
+        if _loadingConfig then return end
+        state.infiniteAmmo = e
+        if e then AMMO.install(); AMMO.wrapExisting()
+        elseif not state.instantReload then AMMO.uninstall() end
+    end, state.infiniteAmmo)
+    ammoSec:Label("Wand: bypasses local mana checks. Server validation still applies.")
+    uiHandles.checkboxes.instantReload = ammoSec:Checkbox("⚡ Instant Reload", function(e)
+        if _loadingConfig then return end
+        state.instantReload = e
+        if e then AMMO.install(); AMMO.wrapExisting()
+        elseif not state.infiniteAmmo then AMMO.uninstall() end
+    end, state.instantReload)
+
+    -- ================== UTILITIES ==================
+    local charSec = UtilitiesTab:Section("🛡️ Stamina & Protection")
+    uiHandles.checkboxes.infiniteStamina = charSec:Checkbox("⚡ Infinite Stamina", function(e)
+        if _loadingConfig then return end
+        state.infiniteStamina = e
+        if e then CHAR.applyInfiniteStamina() else CHAR.removeInfiniteStamina() end
+        CHAR.sync()
+    end, state.infiniteStamina)
+    uiHandles.checkboxes.antiRagdoll = charSec:Checkbox("🛡️ Prevent Ragdoll", function(e)
+        if _loadingConfig then return end
+        state.antiRagdoll = e
+        if e then CHAR.applyAntiRagdoll(); CHAR.removeAntiFallDamage() else CHAR.removeAntiRagdoll() end
+        CHAR.sync()
+    end, state.antiRagdoll)
+    uiHandles.checkboxes.antiFallDamage = charSec:Checkbox("🪂 Prevent Fall Damage", function(e)
+        if _loadingConfig then return end
+        state.antiFallDamage = e
+        if e and not state.antiRagdoll then CHAR.applyAntiFallDamage() else CHAR.removeAntiFallDamage() end
+        CHAR.sync()
+    end, state.antiFallDamage)
+    uiHandles.checkboxes.infiniteHorseStamina = charSec:Checkbox("🐎 Infinite Horse Stamina", function(e)
+        if _loadingConfig then return end
+        state.infiniteHorseStamina = e
+        if e then CHAR.applyHorseStamina() else CHAR.removeHorseStamina() end
+    end, state.infiniteHorseStamina)
+
+    local waterSec = UtilitiesTab:Section("🌊 Water")
+    uiHandles.checkboxes.walkUnderWater = waterSec:Checkbox("🚶 Walk Underwater", function(e)
+        if _loadingConfig then return end
+        state.walkUnderWater = e
+        Water.setWalkUnderWater(e)
+    end, state.walkUnderWater)
+    uiHandles.checkboxes.allowGunsUnderWater = waterSec:Checkbox("🔫 Use Guns Underwater", function(e)
+        if _loadingConfig then return end
+        state.allowGunsUnderWater = e
+        Water.setAllowGunsUnderWater(e)
+    end, state.allowGunsUnderWater)
+
+    local physSec = UtilitiesTab:Section("🏃 Movement & Physics")
+    uiHandles.checkboxes.gravityEnabled = physSec:Checkbox("🌍 Custom Gravity", function(e)
+        if _loadingConfig then return end
+        Physics.setGravity(e, state.gravityValue)
+    end, state.gravityEnabled)
+    uiHandles.sliders.gravityValue = physSec:Slider("🌍 Gravity", 83, 500, state.gravityValue, function(v)
+        if _loadingConfig then return end
+        state.gravityValue = v
+        if state.gravityEnabled then Physics.setGravity(true, v) end
+    end, 1)
+    uiHandles.checkboxes.hipHeightEnabled = physSec:Checkbox("↕️ Custom Hip Height", function(e)
+        if _loadingConfig then return end
+        Physics.setHipHeight(e, state.hipHeightValue)
+    end, state.hipHeightEnabled)
+    uiHandles.sliders.hipHeightValue = physSec:Slider("↕️ Hip Height", 1, 10, state.hipHeightValue, function(v)
+        if _loadingConfig then return end
+        state.hipHeightValue = v
+        if state.hipHeightEnabled then Physics.setHipHeight(true, v) end
+    end, 0.5)
+    uiHandles.checkboxes.speedEnabled = physSec:Checkbox("💨 Custom Movement Speed", function(e)
+        if _loadingConfig then return end
+        Physics.setSpeed(e, state.speedValue)
+    end, state.speedEnabled)
+    uiHandles.sliders.speedValue = physSec:Slider("💨 Movement Speed", 1, 45, state.speedValue, function(v)
+        if _loadingConfig then return end
+        state.speedValue = v
+        if state.speedEnabled then Physics.setSpeed(true, v) end
+    end, 1)
+
+    local fbSec = UtilitiesTab:Section("☀️ Full Bright")
+    fbSec:Label("Set brightness to 0 to restore the game's lighting.")
+    uiHandles.sliders.fullBrightLevel = fbSec:Slider("☀️ Brightness (0 = Off)", 0, 5, state.fullBrightLevel,
+        function(v)
+            if _loadingConfig then return end
+            FB.setLevel(v)
+        end, 1)
+
+    local timeSec = UtilitiesTab:Section("🌅 World Time")
+    uiHandles.checkboxes.alwaysDay = timeSec:Checkbox("🌤️ Always Daytime", function(e)
+        if _loadingConfig then return end
+        state.alwaysDay = e
+        if FB.applyTime then FB.applyTime() end
+    end, state.alwaysDay)
+
+    -- ================== CONFIG ==================
+    local profSec = ConfigTab:Section("💾 Saved Profiles")
+    profSec:Label("✏️ Profile Name")
+    uiHandles.textboxes.configName = profSec:Textbox("Profile name...",
+        function(t, enter) if _loadingConfig then return end state.currentConfig = t end, state.currentConfig)
+
+    local function refreshConfigDropdown()
+        local files = CFG.getFiles()
+        if #files == 0 then files = {"(no saved profiles)"} end
+        local current = state.currentConfig
+        local found = false
+        for _, n in ipairs(files) do if n == current then found = true break end end
+        if not found and current ~= "" and current ~= "(no saved profiles)" then
+            table.insert(files, current); table.sort(files)
+        end
+        if uiHandles.dropdowns.configDropdown then
+            uiHandles.dropdowns.configDropdown:SetOptions(files)
+            uiHandles.dropdowns.configDropdown:Set(state.currentConfig)
+            return
+        end
+        uiHandles.dropdowns.configDropdown = profSec:Dropdown("📂 Saved Profiles", files, function(v)
+            if _loadingConfig then return end
+            state.currentConfig = v
+            if uiHandles.textboxes.configName then
+                pcall(function() uiHandles.textboxes.configName:Set(v) end)
+            end
+        end, state.currentConfig)
+    end
+    refreshConfigDropdown()
+
+    profSec:Button("💾 Save Profile", function()
+        local name = state.currentConfig
+        if name == "" or name == "(no saved profiles)" then toast("Enter a valid profile name first.", 3); return end
+        if SaveStateToConfig(name) then refreshConfigDropdown(); toast("Saved as \""..name.."\"", 2)
+        else toast("Save failed. Check console.", 3) end
+    end)
+    profSec:Button("📂 Load Profile", function()
+        local name = state.currentConfig
+        if name == "" or name == "(no saved profiles)" then toast("Select a profile first.", 3); return end
+        if LoadStateFromConfig(name) then
+            updateUIFromState(); ESP.updateFOV()
+            if uiHandles.checklists.animalFilter then
+                pcall(function() uiHandles.checklists.animalFilter:SetSelected(state.animalFilter or {}) end)
+            end
+            toast("Loaded \""..name.."\"", 2)
+        else toast("Load failed.", 3) end
+    end)
+    profSec:Button("🗑️ Delete Profile", function()
+        local name = state.currentConfig
+        if name == "" or name == "(no saved profiles)" then toast("Select a profile to delete.", 3); return end
+        if not CFG.delete(name) then toast("Delete failed.", 3); return end
+        state.currentConfig = "Default"
+        if uiHandles.textboxes.configName then
+            pcall(function() uiHandles.textboxes.configName:Set("Default") end)
+        end
+        refreshConfigDropdown()
+        toast("Deleted \""..name.."\"", 2)
+    end)
+    profSec:Button("🔄 Refresh Profiles", function() refreshConfigDropdown() end)
+    profSec:Button("♻️ Restore Default Settings", function()
+        ResetStateToDefault(); ESP.updateFOV()
+        toast("All settings reset.", 2)
+    end)
+    profSec:Label(CFG.ready and "Preferences save on close. Active effects always load OFF." or "Profile storage is unavailable in this executor.")
+
+    local sysSec = ConfigTab:Section("🚪 Session & Cleanup")
+    sysSec:Button("🛑 Stop All Features", function()
+        if stopAll then stopAll() end
+        toast("All features stopped and owned changes restored.", 2)
+    end)
+    sysSec:Button("✖️ Unload Script", function() if destroyRuntime then destroyRuntime() end end)
+    sysSec:Button("🚪 Join Another Server", function()
         local placeId = game.PlaceId
         local currentJob = game.JobId
         local function fetch()
@@ -2595,521 +3379,126 @@ local function initUI()
         end
     end)
 
-    -- ================== VISUALS ==================
-    local infoSec = VisualsTab:Section("📊 Information Display")
-    local function dispToggle(label, key)
-        uiHandles.checkboxes[key] = infoSec:Checkbox(label, function(e)
-            if _loadingConfig then return end
-            state[key] = e
-        end, state[key])
-    end
-    dispToggle("Show Names", "showNames")
-    dispToggle("Show Distance", "showDistance")
-    dispToggle("Show Health", "showHealth")
-    dispToggle("Show Tracers", "showTracers")
-    dispToggle("Show Ore Count", "showOreCount")
-    dispToggle("Show Ore Tier", "showOreTier")
-    dispToggle("Legendary Animals Only", "showLegendaryOnly")
-    dispToggle("Golden Legendary Highlight", "legendaryGoldenMode")
 
-    uiHandles.checkboxes.chamsEnabled = infoSec:Checkbox("Enable Chams", function(e)
-        if _loadingConfig then return end
-        state.chamsEnabled = e
-        if e then
-            if ESP.clearAllChams then ESP.clearAllChams() end
-        end
-    end, state.chamsEnabled)
+    local dbgSec = ConfigTab:Section("🔧 Diagnostics")
+    uiHandles.checkboxes.debugPrints = dbgSec:Checkbox("🐞 Combat Debug Logs", function(enabled)
+        if not _loadingConfig then state.debugPrints = enabled end
+    end, state.debugPrints)
+    uiHandles.checkboxes.suppressErrors = dbgSec:Checkbox("🔇 Hide Script Warnings", function(enabled)
+        if not _loadingConfig then state.suppressErrors = enabled end
+    end, state.suppressErrors)
 
-    local bodySec = VisualsTab:Section("🎯 ESP Body Highlight")
-    bodySec:Label("Which body part groups to highlight red.")
-    bodySec:Label("Animals: only Head red. Legendary: every part gold.")
-    uiHandles.checklists.espBodyHighlight = bodySec:Checklist("Body Parts",
-        BODY_HIGHLIGHT_OPTIONS,
-        function(list)
-            if _loadingConfig then return end
-            state.espBodyHighlight = list or {}
-        end, state.espBodyHighlight or {})
-
-    bodySec:Button("🔄 Reset Highlights", function()
-        if ESP.resetHighlights then
-            ESP.resetHighlights()
-            toast("Rebuilding highlights one by one...", 2)
-        end
-    end)
-
-    local colorSec = VisualsTab:Section("🎨 Colors")
-    local function colorDD(label, key)
-        uiHandles.dropdowns[key] = colorSec:Dropdown(label, COLOR_OPTIONS, function(v)
-            if _loadingConfig then return end
-            state[key] = v
-        end, state[key])
-    end
-    for _, pair in ipairs({
-        {"Player","playerColor"},{"NPC","npcColor"},{"Animal","animalColor"},{"Horse","horseColor"},
-        {"Ore","oreColor"},{"Item","itemColor"},{"Chest","chestColor"},{"Train","trainColor"},
-        {"Territory","territoryColor"},{"Fish","fishColor"},{"Dead Animal","deadAnimalColor"},
-        {"Thunderstruck","thunderstruckColor"},
-        {"Legendary Highlight","legendaryColor"},{"Tracer","tracerColor"},
-    }) do colorDD(pair[1], pair[2]) end
-
-    -- ================== ANIMAL FILTER ==================
-    local animalSec = VisualsTab:Section("🦌 Animal Filter")
-    animalSec:Label("Zaškrtni druhy zvířat, které chceš vidět v ESP.")
-    animalSec:Label("Legendární zvířata (včetně Wendigo) se zobrazují VŽDY.")
-    animalSec:Label("Prázdný seznam = zobrazit všechna zvířata.")
-
-    local animalChecklist = nil
-    local function rebuildAnimalChecklist()
-        local names = (ESP.collectAnimalNames and ESP.collectAnimalNames()) or {}
-        if #names == 0 then names = {"(žádná zvířata nenalezena)"} end
-        if animalChecklist then
-            pcall(function() animalChecklist:Destroy() end)
-            animalChecklist = nil
-        end
-        animalChecklist = animalSec:Checklist("Animal Types", names,
-            function(list)
-                if _loadingConfig then return end
-                state.animalFilter = list or {}
-            end, state.animalFilter or {})
-        uiHandles.checklists.animalFilter = animalChecklist
-    end
-    rebuildAnimalChecklist()
-
-    animalSec:Button("🔄 Refresh Animal List", function()
-        rebuildAnimalChecklist()
-        toast("Seznam zvířat obnoven ("..#(state.animalFilter or {}).." vybráno)", 2)
-    end)
-    animalSec:Button("✔ Check All", function()
-        local names = (ESP.collectAnimalNames and ESP.collectAnimalNames()) or {}
-        state.animalFilter = names
-        if animalChecklist then
-            pcall(function() animalChecklist:Set(names) end)
-        end
-        toast("Všechna zvířata zapnuta.", 2)
-    end)
-    animalSec:Button("✖ Clear Filter (show all)", function()
-        state.animalFilter = {}
-        if animalChecklist then
-            pcall(function() animalChecklist:Set({}) end)
-        end
-        toast("Filtr vymazán — zobrazí se vše.", 2)
-    end)
-
-    task.spawn(function()
-        task.wait(4)
-        pcall(function()
-            if not state.destroyed then rebuildAnimalChecklist() end
-        end)
-    end)
-
-    local perfSec = VisualsTab:Section("📏 Distance & Performance")
-    uiHandles.sliders.maxDistance = perfSec:Slider("Max Distance (ESP, 0=unlimited)", 0, 5000, state.maxDistance,
-        function(v) if _loadingConfig then return end state.maxDistance = v end, 10)
-    uiHandles.sliders.updateInterval = perfSec:Slider("Update Interval (s)", 0.05, 1, state.updateInterval,
-        function(v) if _loadingConfig then return end state.updateInterval = v end, 0.05)
-    uiHandles.sliders.labelSize = perfSec:Slider("Label Size", 10, 20, state.labelSize, function(v)
-        if _loadingConfig then return end
-        state.labelSize = v
-        ESP.setLabelSize(v)
-    end, 1)
-    uiHandles.sliders.tracerThickness = perfSec:Slider("Tracer Thickness", 1, 5, state.tracerThickness,
-        function(v) if _loadingConfig then return end state.tracerThickness = v end, 1)
-    uiHandles.sliders.tracerTransparency = perfSec:Slider("Tracer Transparency", 0, 1, state.tracerTransparency,
-        function(v) if _loadingConfig then return end state.tracerTransparency = v end, 0.05)
-
-    -- ================== COMBAT ==================
-    local aimCombatSec = CombatTab:Section("🎯 Silent Aim")
-    local silentAimBox = aimCombatSec:Checkbox("Enable Silent Aim", function(e)
-        if _loadingConfig then return end
-        state.silentAim = e
-        ESP.updateFOV()
-    end, state.silentAim)
-    uiHandles.checkboxes.silentAim = silentAimBox
-    pcall(function()
-        aimCombatSec:Bind("Silent Aim Hotkey", Enum.KeyCode.J, function()
-            state.silentAim = not state.silentAim
-            pcall(function() silentAimBox:Set(state.silentAim) end)
-            ESP.updateFOV()
-            toast("Silent Aim "..(state.silentAim and "ON" or "OFF"), 2)
-        end)
-    end)
-
-    uiHandles.dropdowns.targetPart = aimCombatSec:Dropdown("Target Part",
-        {"Head","UpperTorso","LowerTorso","Random","Closest"},
-        function(v) if _loadingConfig then return end state.targetPart = v end, state.targetPart)
-    aimCombatSec:Label("Controls which body part Silent Aim locks onto.")
-
-    local tgtSec = CombatTab:Section("── Targets ──")
-    local function ctToggle(label, key)
-        uiHandles.checkboxes[key] = tgtSec:Checkbox(label, function(e)
-            if _loadingConfig then return end
-            state[key] = e
-        end, state[key])
-    end
-    ctToggle("Target Players", "targetPlayers")
-    ctToggle("Target Animals 🦌", "targetAnimals")
-    ctToggle("Target NPCs", "targetNPCs")
-
-    local aimingSec = CombatTab:Section("── Aiming ──")
-    uiHandles.sliders.fov = aimingSec:Slider("FOV (°)", 5, 180, state.fov, function(v)
-        if _loadingConfig then return end
-        state.fov = v
-        ESP.updateFOV()
-    end, 5)
-    uiHandles.checkboxes.visibilityCheck = aimingSec:Checkbox("Visibility Check", function(e)
-        if _loadingConfig then return end
-        state.visibilityCheck = e
-    end, state.visibilityCheck)
-    uiHandles.checkboxes.showFOVRing = aimingSec:Checkbox("Show FOV Ring", function(e)
-        if _loadingConfig then return end
-        state.showFOVRing = e
-        ESP.updateFOV()
-    end, state.showFOVRing)
-
-    -- ==== Movement Prediction (NEW) ====
-    local predSec = CombatTab:Section("── Prediction ──")
-    uiHandles.checkboxes.silentAimPrediction = predSec:Checkbox(
-        "Enable Movement Prediction", function(e)
-            if _loadingConfig then return end
-            state.silentAimPrediction = e
-        end, state.silentAimPrediction)
-
-    uiHandles.sliders.silentAimPredictionStrength = predSec:Slider(
-        "Prediction Strength (0–2)", 0, 2, state.silentAimPredictionStrength,
-        function(v)
-            if _loadingConfig then return end
-            state.silentAimPredictionStrength = v
-        end, 0.05)
-
-    predSec:Label("0 = aim at current position, 1 = perfect lead, >1 = over-lead.")
-    predSec:Label("Speed estimation: guns = ProjectilePower, arrows = Min/Max lerp.")
-
-    local gunSec = CombatTab:Section("🔫 Gunplay")
-    uiHandles.checkboxes.noRecoil = gunSec:Checkbox("No Recoil", function(e)
-        if _loadingConfig then return end
-        state.noRecoil = e
-        HOOKS.applyNoRecoil(e)
-    end, state.noRecoil)
-    uiHandles.checkboxes.noSpread = gunSec:Checkbox("No Projectile Spread", function(e)
-        if _loadingConfig then return end
-        state.noSpread = e
-    end, state.noSpread)
-
-    local ammoSec = CombatTab:Section("🎯 Ammo")
-    uiHandles.checkboxes.infiniteAmmo = ammoSec:Checkbox("Infinite Ammo", function(e)
-        if _loadingConfig then return end
-        state.infiniteAmmo = e
-        if e then AMMO.install(); AMMO.wrapExisting() end
-    end, state.infiniteAmmo)
-    uiHandles.checkboxes.instantReload = ammoSec:Checkbox("Instant Reload", function(e)
-        if _loadingConfig then return end
-        state.instantReload = e
-        if e then AMMO.install(); AMMO.wrapExisting() end
-    end, state.instantReload)
-
-    -- ================== UTILITIES ==================
-    local charSec = UtilitiesTab:Section("🏃 Character")
-    uiHandles.checkboxes.infiniteStamina = charSec:Checkbox("Infinite Stamina", function(e)
-        if _loadingConfig then return end
-        state.infiniteStamina = e
-        if e then CHAR.applyInfiniteStamina() else CHAR.removeInfiniteStamina() end
-        CHAR.sync()
-    end, state.infiniteStamina)
-    uiHandles.checkboxes.antiRagdoll = charSec:Checkbox("Anti Ragdoll (only me)", function(e)
-        if _loadingConfig then return end
-        state.antiRagdoll = e
-        if e then CHAR.applyAntiRagdoll(); CHAR.removeAntiFallDamage() else CHAR.removeAntiRagdoll() end
-        CHAR.sync()
-    end, state.antiRagdoll)
-    uiHandles.checkboxes.antiFallDamage = charSec:Checkbox("Anti Fall Damage (only fall)", function(e)
-        if _loadingConfig then return end
-        state.antiFallDamage = e
-        if e and not state.antiRagdoll then CHAR.applyAntiFallDamage() else CHAR.removeAntiFallDamage() end
-        CHAR.sync()
-    end, state.antiFallDamage)
-    uiHandles.checkboxes.infiniteHorseStamina = charSec:Checkbox("Infinite Horse Stamina", function(e)
-        if _loadingConfig then return end
-        state.infiniteHorseStamina = e
-        if e then CHAR.applyHorseStamina() else CHAR.removeHorseStamina() end
-    end, state.infiniteHorseStamina)
-
-    local waterSec = UtilitiesTab:Section("🌊 Water")
-    uiHandles.checkboxes.walkUnderWater = waterSec:Checkbox("Walk Under Water", function(e)
-        if _loadingConfig then return end
-        state.walkUnderWater = e
-        Water.setWalkUnderWater(e)
-    end, state.walkUnderWater)
-    uiHandles.checkboxes.allowGunsUnderWater = waterSec:Checkbox("Allow Guns Underwater", function(e)
-        if _loadingConfig then return end
-        state.allowGunsUnderWater = e
-        Water.setAllowGunsUnderWater(e)
-    end, state.allowGunsUnderWater)
-
-    local physSec = UtilitiesTab:Section("🧲 Physics")
-    uiHandles.checkboxes.gravityEnabled = physSec:Checkbox("Enable Gravity Changer", function(e)
-        if _loadingConfig then return end
-        Physics.setGravity(e, state.gravityValue)
-    end, state.gravityEnabled)
-    uiHandles.sliders.gravityValue = physSec:Slider("Gravity (min 83, default 196.2)", 83, 500, state.gravityValue, function(v)
-        if _loadingConfig then return end
-        state.gravityValue = v
-        if state.gravityEnabled then Physics.setGravity(true, v) end
-    end, 1)
-    uiHandles.checkboxes.hipHeightEnabled = physSec:Checkbox("Enable Hip Height", function(e)
-        if _loadingConfig then return end
-        Physics.setHipHeight(e, state.hipHeightValue)
-    end, state.hipHeightEnabled)
-    uiHandles.sliders.hipHeightValue = physSec:Slider("Hip Height (1-10)", 1, 10, state.hipHeightValue, function(v)
-        if _loadingConfig then return end
-        state.hipHeightValue = v
-        if state.hipHeightEnabled then Physics.setHipHeight(true, v) end
-    end, 0.5)
-    uiHandles.checkboxes.speedEnabled = physSec:Checkbox("Enable Speed Changer", function(e)
-        if _loadingConfig then return end
-        Physics.setSpeed(e, state.speedValue)
-    end, state.speedEnabled)
-    uiHandles.sliders.speedValue = physSec:Slider("WalkSpeed (1-45)", 1, 45, state.speedValue, function(v)
-        if _loadingConfig then return end
-        state.speedValue = v
-        if state.speedEnabled then Physics.setSpeed(true, v) end
-    end, 1)
-
-    local fbSec = UtilitiesTab:Section("☀️ Full Bright")
-    fbSec:Label("0 = OFF (heartbeat disconnected). 1-5 = ExposureCompensation locked via Heartbeat.")
-    uiHandles.sliders.fullBrightLevel = fbSec:Slider("Brightness Level (0=off, 1-5)", 0, 5, state.fullBrightLevel,
-        function(v)
-            if _loadingConfig then return end
-            FB.setLevel(v)
-        end, 1)
-
-    local timeSec = UtilitiesTab:Section("🌅 World Time")
-    uiHandles.checkboxes.alwaysDay = timeSec:Checkbox("Always Day (fix noon)", function(e)
-        if _loadingConfig then return end
-        state.alwaysDay = e
-        if FB.applyTime then FB.applyTime() end
-    end, state.alwaysDay)
-
-    local dbgSec = UtilitiesTab:Section("🐞 Debug")
-    uiHandles.checkboxes.debugPrints = dbgSec:Checkbox("Debug Prints (combat)",
-        function(e) if _loadingConfig then return end state.debugPrints = e end, state.debugPrints)
-
-    local sysSec = UtilitiesTab:Section("⚙️ System")
-    sysSec:Button("Restore Defaults", function()
-        ResetStateToDefault()
-        ESP.updateFOV()
-        toast("Settings restored to defaults", 2)
-    end)
-    sysSec:Button("Silence ON/OFF (toggle errors)", function()
-        state.suppressErrors = not state.suppressErrors
-        if uiHandles.checkboxes.suppressErrors then
-            pcall(function() uiHandles.checkboxes.suppressErrors:Set(state.suppressErrors) end)
-        end
-        toast("Errors "..(state.suppressErrors and "SUPPRESSED" or "VISIBLE"), 2)
-    end)
-    sysSec:Button("Unhook Everything (panic)", function()
-        state.silentAim = false
-        state.silentAimPrediction = false
-        state.noSpread = false
-        state.noRecoil = false
-        state.infiniteAmmo = false
-        state.instantReload = false
-        state.fullBrightLevel = 0
-        state.highlightGoldBars = false
-        state.gravityEnabled = false
-        state.hipHeightEnabled = false
-        state.speedEnabled = false
-        state.walkUnderWater = false
-        state.allowGunsUnderWater = false
-        if HOOKS.uninstall then HOOKS.uninstall() end
-        if AMMO.uninstall then AMMO.uninstall() end
-        if FB.setLevel then FB.setLevel(0) end
-        if FB.stop then pcall(FB.stop) end
-        if Physics.stop then pcall(Physics.stop) end
-        if Water then Water.setWalkUnderWater(false); Water.setAllowGunsUnderWater(false) end
-        if ESP.updateGoldBars then ESP.updateGoldBars() end
-        updateUIFromState()
-        ESP.updateFOV()
-        toast("All hooks removed — vanilla restored.", 3)
-    end)
-
-    -- ================== CONFIG ==================
-    local profSec = ConfigTab:Section("📝 Profiles")
-    uiHandles.textboxes.configName = profSec:Textbox("Profile name...",
-        function(t, enter) if _loadingConfig then return end state.currentConfig = t end, state.currentConfig)
-
-    local function refreshConfigDropdown()
-        if uiHandles.dropdowns.configDropdown then
-            pcall(function() uiHandles.dropdowns.configDropdown:Destroy() end)
-            uiHandles.dropdowns.configDropdown = nil
-        end
-        local files = CFG.getFiles()
-        if #files == 0 then files = {"(no saved profiles)"} end
-        local current = state.currentConfig
-        local found = false
-        for _, n in ipairs(files) do if n == current then found = true break end end
-        if not found and current ~= "" and current ~= "(no saved profiles)" then
-            table.insert(files, current); table.sort(files)
-        end
-        uiHandles.dropdowns.configDropdown = profSec:Dropdown("📂 Saved Profiles", files, function(v)
-            if _loadingConfig then return end
-            state.currentConfig = v
-            if uiHandles.textboxes.configName then
-                pcall(function() uiHandles.textboxes.configName:Set(v) end)
-            end
-        end, state.currentConfig)
-    end
-    refreshConfigDropdown()
-
-    profSec:Button("💾 Save Profile", function()
-        local name = state.currentConfig
-        if name == "" or name == "(no saved profiles)" then toast("Enter a valid profile name first.", 3); return end
-        if SaveStateToConfig(name) then refreshConfigDropdown(); toast("Saved as \""..name.."\"", 2)
-        else toast("Save failed. Check console.", 3) end
-    end)
-    profSec:Button("📂 Load Profile", function()
-        local name = state.currentConfig
-        if name == "" or name == "(no saved profiles)" then toast("Select a profile first.", 3); return end
-        if LoadStateFromConfig(name) then
-            updateUIFromState(); ESP.updateFOV()
-            if uiHandles.checklists.animalFilter then
-                pcall(function() uiHandles.checklists.animalFilter:Set(state.animalFilter or {}) end)
-            end
-            toast("Loaded \""..name.."\"", 2)
-        else toast("Load failed.", 3) end
-    end)
-    profSec:Button("🗑️ Delete Profile", function()
-        local name = state.currentConfig
-        if name == "" or name == "(no saved profiles)" then toast("Select a profile to delete.", 3); return end
-        if not CFG.delete(name) then toast("Delete failed.", 3); return end
-        state.currentConfig = "Default"
-        if uiHandles.textboxes.configName then
-            pcall(function() uiHandles.textboxes.configName:Set("Default") end)
-        end
-        refreshConfigDropdown()
-        toast("Deleted \""..name.."\"", 2)
-    end)
-    profSec:Button("🔄 Refresh List", function() refreshConfigDropdown() end)
-    profSec:Button("♻️ Reset All to Default", function()
-        ResetStateToDefault(); ESP.updateFOV()
-        toast("All settings reset.", 2)
-    end)
-    profSec:Label(CFG.ready and "🟢 Auto-save: ON" or "🔴 Auto-save: OFF (no file access)")
-
-    local aboutSec = ConfigTab:Section("ℹ️ About")
-    aboutSec:Label("TWW Ultimate ESP + Combat (SmugLibV2)")
-    aboutSec:Label("ESP + Silent Aim + No Recoil + No Spread + Infinite Ammo")
-    aboutSec:Label("+ Gravity + Hip Height + Speed")
-    aboutSec:Label("+ Walk Under Water + Guns Underwater + Thunderstruck ESP")
-    aboutSec:Label("+ Animal Filter Checklist (legendary + Wendigo always shown)")
-    aboutSec:Label("+ Wendigo spawn announcement")
-    aboutSec:Label("+ Bank Gold Bars live counter")
-    aboutSec:Label("+ Silent Aim movement prediction")
-    aboutSec:Label("+ Anti Ragdoll now only affects local player")
-    aboutSec:Label("+ Suppress Errors toggle (Main tab)")
-    aboutSec:Label("Binds: J = Silent Aim, RightShift = UI")
 end
 
 -- =================================================================
 --  MAIN
 -- =================================================================
 local function initMain()
-    local renderConnection = nil
-
-    local function startLoop()
-        if renderConnection then return end
-        local token = state.generation
-        renderConnection = S.RunService.RenderStepped:Connect(function()
-            if not state.active or state.destroyed or token ~= state.generation then return end
-            local ok, err = pcall(function()
-                if ESP.update then ESP.update() end
-                if ESP.updateFOV then ESP.updateFOV() end
-            end)
-            if not ok then
-                warn("[TWW] RenderStepped error: "..tostring(err))
-            end
-        end)
-    end
-    local function stopLoop()
-        if renderConnection then pcall(function() renderConnection:Disconnect() end); renderConnection = nil end
-    end
-    local function startESP()
-        if state.destroyed or state.active then return end
-        state.active = true
-        state.generation = state.generation + 1
-        if ESP.refresh then ESP.refresh() end
-        startLoop()
-        ESP.lastUpdate = 0
-        if ESP.createFOV then ESP.createFOV() end
-        if ESP.updateFOV then ESP.updateFOV() end
-    end
-    local function stopESP()
-        if not state.active then return end
-        state.active = false
-        state.generation = state.generation + 1
-        stopLoop()
-        if ESP.cleanup then ESP.cleanup() end
-        local r = ESP.getFOVRing and ESP.getFOVRing()
-        if r then r.Visible = false end
-    end
-    local function destroyESP()
-        if state.destroyed then return end
-        state.destroyed = true
-        if HOOKS.uninstall then HOOKS.uninstall() end
-        if AMMO.uninstall then AMMO.uninstall() end
-        if FB.stop then pcall(FB.stop) end
-        if Physics.stop then pcall(Physics.stop) end
-        pcall(function() S.Lighting.ExposureCompensation = 0 end)
-        if ESP.clearFOVRing then ESP.clearFOVRing() end
-        stopESP()
-        if ESP.cleanupDrawings then ESP.cleanupDrawings() end
-        if state.window then pcall(function() state.window:Kill() end) end
-    end
     local controller = {}
-    function controller:Start() startESP() end
-    function controller:Stop() stopESP() end
-    function controller:Destroy() destroyESP() end
-    environment.TWWESP = controller
-
-    state.destroyed = false
-    state.active = false
-
-    startESP()
-
-    task.delay(0.5, function()
-        if not state.destroyed and not state.active then
-            state.destroyed = false
-            state.active = false
-            startESP()
+    local renderConnection
+    local function restore(fn)
+        if type(fn) == "function" then
+            local ok, err = pcall(fn)
+            if not ok then originalWarn("[TWW] Cleanup: " .. tostring(err)) end
         end
+    end
+    stopAll = function()
+        if state.destroyed then return end
+        for _, key in ipairs({"espEnabled","silentAim","noSpread","noRecoil","infiniteAmmo","instantReload",
+            "infiniteStamina","antiRagdoll","antiFallDamage","infiniteHorseStamina","alwaysDay",
+            "gravityEnabled","hipHeightEnabled","speedEnabled","walkUnderWater","allowGunsUnderWater","highlightGoldBars"}) do
+            state[key] = false
+        end
+        state.fullBrightLevel = 0
+        restore(CHAR.removeInfiniteStamina)
+        restore(CHAR.removeAntiRagdoll)
+        restore(CHAR.removeAntiFallDamage)
+        restore(CHAR.removeHorseStamina)
+        restore(CHAR.unhookFireServer)
+        restore(HOOKS.uninstall)
+        restore(AMMO.uninstall)
+        restore(FB.stop)
+        restore(Physics.stop)
+        restore(INV.stop)
+        restore(function() Water.setWalkUnderWater(false); Water.setAllowGunsUnderWater(false) end)
+        restore(ESP.cleanup)
+        restore(ESP.updateFOV)
+        updateUIFromState()
+    end
+    destroyRuntime = function()
+        if state.destroyed then return end
+        stopAll()
+        state.destroyed = true
+        state.active = false
+        state.generation += 1
+        if renderConnection then renderConnection:Disconnect(); renderConnection = nil end
+        for _, connection in ipairs(ownedConnections) do restore(function() connection:Disconnect() end) end
+        table.clear(ownedConnections)
+        for _, instance in ipairs(ownedInstances) do restore(function() instance:Destroy() end) end
+        table.clear(ownedInstances)
+        restore(ESP.clearFOVRing)
+        restore(ESP.cleanupDrawings)
+        if state.window then restore(function() state.window:Kill() end) end
+        if environment.TWWESP == controller then environment.TWWESP = nil end
+    end
+    function controller:StopAll() stopAll() end
+    function controller:Stop() stopAll() end
+    function controller:Destroy() destroyRuntime() end
+    function controller:Start()
+        if not state.destroyed and not state.active then state.active = true end
+    end
+    function controller:SetFeature(key, enabled)
+        assert(not state.destroyed, "TWW is unloaded")
+        assert(type(enabled) == "boolean" and uiHandles.checkboxes[key], "Unknown feature")
+        local handle = uiHandles.checkboxes[key]
+        if handle:Get() ~= enabled then handle:Toggle() end
+    end
+    function controller:GetStatus()
+        local features = {}
+        for key in pairs(uiHandles.checkboxes) do features[key] = state[key] end
+        local objects, objectsByType = 0, {}
+        for _, object in pairs(ESP.objects or {}) do
+            objects += 1
+            local kind = object.entityType or "unknown"
+            objectsByType[kind] = (objectsByType[kind] or 0) + 1
+        end
+        return {active=state.active,destroyed=state.destroyed,features=features,objects=objects,
+            objectsByType=objectsByType,event=Adapter.snapshot and Adapter.snapshot() or {},profile=state.currentConfig}
+    end
+    function controller:LoadProfile(name)
+        local loaded = LoadStateFromConfig(name)
+        if loaded then updateUIFromState() end
+        return loaded
+    end
+    environment.TWWESP = controller
+    state.active = true
+    renderConnection = connect(S.RunService.RenderStepped, function()
+        if not state.active then return end
+        S.Camera = S.Workspace.CurrentCamera or S.Camera
+        if ESP.update then ESP.update() end
+        if ESP.updateFOV then ESP.updateFOV() end
     end)
-
-    pcall(function()
-        game:BindToClose(function()
-            pcall(function() SaveStateToConfig(state.currentConfig) end)
-            destroyESP()
-        end)
-    end)
-    S.LocalPlayer.CharacterAdded:Connect(function()
+    if ESP.createFOV then ESP.createFOV() end
+    local function refreshCharacter()
         if ESP.cleanup then ESP.cleanup() end
         if ESP.refresh then ESP.refresh() end
-        task.wait(0.5)
-        if Water and Water.reapply then Water.reapply() end
-        if CHAR and CHAR.sync then CHAR.sync() end
-        if Physics and Physics.reapplyHip then Physics.reapplyHip() end
-        if Physics and Physics.reapplySpeed then Physics.reapplySpeed() end
-    end)
-    S.Players.PlayerAdded:Connect(function(p)
-        task.spawn(function()
-            p.CharacterAdded:Wait()
-            task.wait(0.3)
-            if ESP.refresh then ESP.refresh() end
-            p.CharacterAdded:Connect(function()
-                if ESP.cleanup then ESP.cleanup() end
-                task.wait(0.3)
+        task.delay(0.5, function()
+            if state.destroyed then return end
+            if Water.reapply then Water.reapply() end
+            if CHAR.sync then CHAR.sync() end
+            if Physics.reapplyHip then Physics.reapplyHip() end
+        end)
+    end
+    connect(S.LocalPlayer.CharacterAdded, refreshCharacter)
+    local function watchPlayer(player)
+        if player ~= S.LocalPlayer then
+            connect(player.CharacterAdded, function()
                 if ESP.refresh then ESP.refresh() end
             end)
-        end)
-    end)
+        end
+    end
+    connect(S.Players.PlayerAdded, watchPlayer)
+    for _, player in ipairs(S.Players:GetPlayers()) do watchPlayer(player) end
 end
 
 -- ====== RUN ALL INIT ======
@@ -3125,6 +3514,7 @@ safeInit("FB", initFB)
 safeInit("FOV", initFOV)
 safeInit("Physics", initPhysics)
 safeInit("Water", initWater)
+safeInit("Adapter", initAdapter)
 safeInit("ESP", initESP)
 safeInit("Char", initChar)
 safeInit("Combat", initCombat)
@@ -3132,14 +3522,26 @@ safeInit("Hooks", initHooks)
 safeInit("Ammo", initAmmo)
 safeInit("Inventory", initInventory)
 safeInit("WendigoAnnouncer", initWendigoAnnouncer)
+_loadingConfig = true
 safeInit("UI", initUI)
+_loadingConfig = false
+if not state.window then
+    state.destroyed = true
+    originalWarn("[TWW] UI initialization failed; runtime was not started.")
+    return nil
+end
 safeInit("Main", initMain)
 
 local loaded = LoadStateFromConfig("Default")
 if loaded then state.currentConfig = "Default" end
 updateUIFromState()
 if HOOKS.install then HOOKS.install() end
-if AMMO.install then AMMO.install() end
+if (state.infiniteAmmo or state.instantReload) and AMMO.install then AMMO.install() end
 if FB.applyTime then FB.applyTime() end
 
 print("[TWW] Loaded. " .. #CFG.getFiles() .. " saved profile(s).")
+return environment.TWWESP
+end
+
+end)()
+return run(Library, environment)
