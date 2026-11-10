@@ -1,4 +1,5 @@
--- TWW | SmugLibV2 | 2026-11-03
+-- TWW | SmugLibV2 | 2026-11-10
+-- Edit src/TWW.luau, then run tools/build.py. UI and licensing belong to shared SmugLibV2.
 if game.PlaceId ~= 2317712696 then
     warn("[TWW] This script supports The Wild West main place only.")
     return
@@ -24,6 +25,318 @@ if type(Library) ~= "table" or type(Library.CreateWindow) ~= "function" then
     return
 end
 local run = (function()
+local Ballistics = (function()
+-- Constant-speed interception with gravity, finite input checks and a bounded flight time.
+return function(origin, position, velocity, speed, gravity, strength, maxTime, vector)
+    local function finite(n) return type(n)=="number" and n==n and math.abs(n)<math.huge end
+    local function valid(v) return v and finite(v.X) and finite(v.Y) and finite(v.Z) end
+    if not valid(origin) or not valid(position) or not valid(velocity) or not finite(speed) or speed<=0.001 then return nil end
+    gravity=finite(gravity) and gravity or 0
+    strength=finite(strength) and math.clamp(strength,0,3) or 0
+    maxTime=finite(maxTime) and math.clamp(maxTime,0.05,10) or 3
+    local relative=position-origin
+    local targetVelocity=velocity*strength
+    local acceleration=vector(0,gravity*0.5,0)
+    -- Find the first positive crossing, then bisect. This rejects targets that cannot be intercepted.
+    local function displacement(t) return relative+targetVelocity*t+acceleration*(t*t) end
+    local function errorAt(t) return displacement(t).Magnitude-speed*t end
+    local low,high=0,nil
+    local previous=errorAt(0)
+    if previous<0.001 then return nil end
+    for i=1,96 do
+        local t=maxTime*i/96
+        local value=errorAt(t)
+        if value<=0 then high=t;break end
+        low=t;previous=value
+    end
+    if not high then return nil end
+    for _=1,24 do
+        local middle=(low+high)*0.5
+        if errorAt(middle)>0 then low=middle else high=middle end
+    end
+    local aim=origin+displacement(high)
+    if not valid(aim) then return nil end
+    return aim,high
+end
+
+end)()
+local OverlayFactory = (function()
+-- Prefer the executor renderer, with a ScreenGui fallback for unsupported Drawing APIs.
+return function(S, own, native)
+    if type(native)=="table" and type(native.new)=="function" then
+        local ok,probe=pcall(native.new,"Text")
+        if ok and probe then
+            pcall(function() probe:Remove() end)
+            return native
+        end
+    end
+    local gui=own(Instance.new("ScreenGui"))
+    gui.Name="TWWOverlay";gui.IgnoreGuiInset=true;gui.ResetOnSpawn=false;gui.DisplayOrder=100
+    gui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+    gui.Parent=S.LocalPlayer:WaitForChild("PlayerGui",10)
+    local api={backend="ScreenGui"}
+    function api.new(kind)
+        local object=Instance.new(kind=="Text" and "TextLabel" or "Frame")
+        object.BackgroundTransparency=1;object.BorderSizePixel=0;object.Visible=false;object.Parent=gui
+        local stroke
+        if kind=="Circle" then
+            local corner=Instance.new("UICorner");corner.CornerRadius=UDim.new(1,0);corner.Parent=object
+            stroke=Instance.new("UIStroke");stroke.Parent=object
+        elseif kind=="Text" then
+            object.Font=Enum.Font.Code;object.TextStrokeColor3=Color3.new(0,0,0)
+            object.Size=UDim2.fromOffset(600,28);object.TextSize=13
+        end
+        local values={Visible=false,Transparency=1,Color=Color3.new(1,1,1),Thickness=1,Size=13,
+            Position=Vector2.zero,From=Vector2.zero,To=Vector2.zero,Radius=0,Center=true,Outline=true,Text=""}
+        local removed=false
+        local function update()
+            if removed then return end
+            object.Visible=values.Visible;object.ZIndex=values.ZIndex or 1
+            if kind=="Text" then
+                object.AnchorPoint=Vector2.new(values.Center and 0.5 or 0,0.5)
+                object.Position=UDim2.fromOffset(values.Position.X,values.Position.Y)
+                object.Text=values.Text;object.TextColor3=values.Color;object.TextSize=values.Size
+                object.TextTransparency=1-values.Transparency
+                object.TextStrokeTransparency=values.Outline and 0.25 or 1
+                object.TextStrokeColor3=values.OutlineColor or Color3.new(0,0,0)
+            elseif kind=="Line" then
+                local delta=values.To-values.From;local midpoint=(values.To+values.From)*0.5
+                object.AnchorPoint=Vector2.new(0.5,0.5);object.Position=UDim2.fromOffset(midpoint.X,midpoint.Y)
+                object.Size=UDim2.fromOffset(delta.Magnitude,values.Thickness)
+                object.Rotation=math.deg(math.atan2(delta.Y,delta.X))
+                object.BackgroundColor3=values.Color;object.BackgroundTransparency=1-values.Transparency
+            else
+                object.AnchorPoint=Vector2.new(0.5,0.5)
+                object.Position=UDim2.fromOffset(values.Position.X,values.Position.Y)
+                object.Size=UDim2.fromOffset(values.Radius*2,values.Radius*2)
+                stroke.Color=values.Color;stroke.Thickness=values.Thickness;stroke.Transparency=1-values.Transparency
+            end
+        end
+        return setmetatable({}, {
+            __index=function(_,key)
+                if key=="Remove" or key=="Destroy" then return function() if not removed then removed=true;object:Destroy() end end end
+                return values[key]
+            end,
+            __newindex=function(_,key,value) values[key]=value;update() end,
+        })
+    end
+    return api
+end
+
+end)()
+local GraphicsFactory = (function()
+-- Reversible visual changes. Only enabled features scan the scene, in bounded batches.
+return function(S, state, connect)
+    local api={}
+    local records=setmetatable({}, {__mode="k"})
+    local queue,head={},1
+    local running,needsScan=false,false
+    local function write(object,key,value)
+        local properties=records[object]
+        local record=properties and properties[key]
+        if value==nil then
+            if record then
+                pcall(function() if object[key]==record.last then object[key]=record.original end end)
+                properties[key]=nil
+                if next(properties)==nil then records[object]=nil end
+            end
+            return
+        end
+        local ok,current=pcall(function() return object[key] end)
+        if not ok then return end
+        if not record then
+            if current==value then return end
+            properties=properties or {};records[object]=properties
+            record={original=current};properties[key]=record
+        end
+        if pcall(function() object[key]=value end) then record.last=value end
+    end
+    local function apply(object)
+        if object:IsA("BasePart") then write(object,"CastShadow",if state.graphicsNoShadows then false else nil) end
+        if object:IsA("ParticleEmitter") or object:IsA("Trail") or object:IsA("Beam")
+            or object:IsA("Smoke") or object:IsA("Fire") or object:IsA("Sparkles") then
+            write(object,"Enabled",if state.graphicsReduceEffects then false else nil)
+        elseif object:IsA("PostEffect") then
+            write(object,"Enabled",if state.graphicsNoPostEffects then false else nil)
+        elseif object:IsA("Decal") or object:IsA("Texture") then
+            write(object,"Transparency",if state.graphicsHideTextures then 1 else nil)
+        end
+    end
+    local function enabled()
+        return state.graphicsNoShadows or state.graphicsReduceEffects or state.graphicsNoPostEffects or state.graphicsHideTextures
+    end
+    local function enqueue(object) queue[#queue+1]=object end
+    function api.sync()
+        table.clear(queue);head=1
+        running=enabled() or state.graphicsLowWater
+        -- Restore affected objects immediately when a feature is disabled.
+        for object in pairs(records) do apply(object) end
+        write(S.Lighting,"GlobalShadows",if state.graphicsNoShadows then false else nil)
+        local terrain=S.Workspace.Terrain
+        if terrain then
+            write(terrain,"WaterWaveSize",if state.graphicsLowWater then 0 else nil)
+            write(terrain,"WaterWaveSpeed",if state.graphicsLowWater then 0 else nil)
+            write(terrain,"WaterReflectance",if state.graphicsLowWater then 0 else nil)
+        end
+        needsScan=enabled()
+    end
+    connect(S.Workspace.DescendantAdded,function(object) if running and enabled() then enqueue(object) end end)
+    connect(S.Lighting.DescendantAdded,function(object) if running and enabled() then enqueue(object) end end)
+    local terrain=S.Workspace.Terrain
+    if terrain and type(terrain.GetPropertyChangedSignal)=="function" then
+        for _,key in ipairs({"WaterWaveSize","WaterWaveSpeed","WaterReflectance"}) do
+            connect(terrain:GetPropertyChangedSignal(key),function()
+                if running and state.graphicsLowWater then write(terrain,key,0) end
+            end)
+        end
+    end
+    connect(S.RunService.Heartbeat,function()
+        if not running then return end
+        -- The game's water controller rewrites these each frame.
+        local terrain=S.Workspace.Terrain
+        if state.graphicsLowWater and terrain then
+            write(terrain,"WaterWaveSize",0);write(terrain,"WaterWaveSpeed",0);write(terrain,"WaterReflectance",0)
+        end
+        if needsScan then
+            needsScan=false;queue=S.Workspace:GetDescendants();head=1
+            for _,object in ipairs(S.Lighting:GetDescendants()) do enqueue(object) end
+        end
+        local started=os.clock();local n=0
+        while head<=#queue and n<256 do
+            local object=queue[head];head+=1;n+=1
+            if object.Parent then apply(object) end
+            if os.clock()-started>=0.0015 then break end
+        end
+        if head>#queue then table.clear(queue);head=1 end
+    end)
+    function api.stop()
+        running=false;needsScan=false
+        table.clear(queue);head=1
+        for object,properties in pairs(records) do
+            for key,record in pairs(properties) do
+                pcall(function() if object[key]==record.last then object[key]=record.original end end)
+            end
+        end
+        table.clear(records)
+    end
+    function api.status()
+        local n=0;for _ in pairs(records) do n+=1 end
+        return {changedObjects=n,queued=math.max(0,#queue-head+1)}
+    end
+    return api
+end
+
+end)()
+local LegacyRepair = (function()
+-- Migrate only the marked, pre-cleanup TWW ammo proxy shipped by this project.
+return function(S, Global)
+    local report={repaired=0,legacy=false}
+    if not Global or type(debug.getupvalues)~="function" or type(debug.getconstants)~="function" then return report end
+    local function values(fn)
+        if type(fn)~="function" then return {} end
+        local ok,result=pcall(debug.getupvalues,fn)
+        return ok and type(result)=="table" and result or {}
+    end
+    local pc=Global.PlayerCharacter
+    if not pc or type(pc.GetItemsRaw)~="function" then return report end
+    local ok,items=pcall(pc.GetItemsRaw,pc)
+    if not ok or type(items)~="table" then return report end
+    for _,item in pairs(items) do
+        local mt=type(item)=="table" and getmetatable(item)
+        if type(mt)=="table" and rawget(mt,"__TWW_AMMO_PROXY")==true then
+            local originals,oldState={},nil
+            for _,value in pairs(values(mt.__index)) do
+                if type(value)=="table" and rawget(value,"infiniteAmmo")~=nil and rawget(value,"infiniteStamina")~=nil
+                    and rawget(value,"active")~=nil then oldState=value
+                elseif type(value)=="function" or type(value)=="table" then table.insert(originals,value) end
+            end
+            if oldState and #originals==1 then
+                -- Stop the old loops before removing their proxy. No unknown runtime is touched.
+                oldState.active=false;oldState.destroyed=true
+                for _,key in ipairs({"infiniteAmmo","instantReload","infiniteStamina","infiniteHorseStamina","silentAim",
+                    "antiRagdoll","antiFallDamage","noRecoil","noSpread","walkUnderWater","allowGunsUnderWater","espEnabled"}) do oldState[key]=false end
+                local restored=table.clone(mt)
+                restored.__TWW_AMMO_PROXY=nil;restored.__index=originals[1];restored.__newindex=nil
+                if pcall(setmetatable,item,restored) then report.repaired+=1;report.legacy=true end
+            end
+        end
+    end
+    if not report.legacy then return report end
+    -- Recover canonical callbacks through the surviving live closures, never by recompilation.
+    local modules=S.ReplicatedStorage:FindFirstChild("Modules")
+    local character=modules and modules:FindFirstChild("Character")
+    local playerScript=character and character:FindFirstChild("PlayerCharacter")
+    local types=character and character:FindFirstChild("Items")
+    types=types and types:FindFirstChild("Types")
+    local gunScript=types and types:FindFirstChild("GunItemType")
+    local function native(fn,scriptInstance,name)
+        if type(fn)~="function" or not scriptInstance or type(getfenv)~="function" then return false end
+        local got,scope=pcall(getfenv,fn)
+        return got and scope.script==scriptInstance and debug.info(fn,"n")==name
+    end
+    local function unwrap(fn,scriptInstance,name,depth)
+        if native(fn,scriptInstance,name) then return fn end
+        if depth==0 then return nil end
+        local found
+        for _,value in pairs(values(fn)) do
+            if type(value)=="function" and value~=fn then
+                local candidate=unwrap(value,scriptInstance,name,depth-1)
+                if candidate then if found and found~=candidate then return nil end;found=candidate end
+            end
+        end
+        return found
+    end
+    local loaded,gun=pcall(Global.LoadModule,Global,"GunItemType")
+    if loaded and type(gun)=="table" then
+        for _,name in ipairs({"Load","Update","ReplicatedUpdate"}) do
+            local original=unwrap(gun[name],gunScript,name,4)
+            if original then gun[name]=original end
+        end
+        local original=unwrap(gun.new,types and types:FindFirstChild("BaseItem"),"new",4)
+        if original then gun.new=original end
+    end
+    if type(getgc)=="function" and playerScript then
+        local missing={}
+        for _,name in ipairs({"LowerStamina","LocalLowerStamina"}) do
+            if not native(pc[name],playerScript,name) then missing[name]={} end
+        end
+        if next(missing) then
+            local got,objects=pcall(getgc,false)
+            if got and type(objects)=="table" then
+                for _,fn in pairs(objects) do
+                    if type(fn)=="function" then
+                        for name,candidates in pairs(missing) do
+                            if native(fn,playerScript,name) then
+                                for _,value in pairs(values(fn)) do if value==Global then candidates[fn]=true;break end end
+                            end
+                        end
+                    end
+                end
+                for name,candidates in pairs(missing) do
+                    local original=next(candidates)
+                    if original and not next(candidates,original) then pc[name]=original end
+                end
+            end
+        end
+    end
+    -- The earliest TWW stamina pin had exactly two metamethods and no inherited state.
+    local ps=Global.ReplicatedState and Global.ReplicatedState.State
+    local mt=type(ps)=="table" and getmetatable(ps)
+    if type(mt)=="table" and type(mt.__index)=="function" and type(mt.__newindex)=="function" then
+        local keys=0;for _ in pairs(mt) do keys+=1 end
+        local got,constants=pcall(debug.getconstants,mt.__index)
+        -- Some executors omit LOADN numeric literals from getconstants.
+        local read,pinned=pcall(mt.__index,ps,"Stamina")
+        if keys==2 and got and table.find(constants,"Stamina") and read and pinned==100
+            and next(values(mt.__index))==nil then
+            local current=ps.Stamina
+            if pcall(setmetatable,ps,nil) then rawset(ps,"Stamina",current) end
+        end
+    end
+    return report
+end
+
+end)()
 return function(Library, environment)
 -- ====== SERVICES ======
 local S = {
@@ -36,7 +349,6 @@ local S = {
     StarterGui = game:GetService("StarterGui"),
     HttpService = game:GetService("HttpService"),
     ReplicatedStorage = game:GetService("ReplicatedStorage"),
-    TweenService = game:GetService("TweenService"),
 }
 S.LocalPlayer = S.Players.LocalPlayer
 S.Camera = S.Workspace.CurrentCamera
@@ -61,7 +373,7 @@ local state = {
     showTerritories=false, showFish=false, showDeadAnimals=false,
     showThunderstruck=false,
     showLegendaryOnly=false, legendaryGoldenMode=false,
-    showNames=false, showDistance=false, showHealth=false, showTracers=false,
+    showNames=true, showDistance=true, showHealth=false, showTracers=false,
     showOreCount=false, showOreTier=false,
     highlightGoldBars=false,
     alwaysDay=false,
@@ -70,12 +382,14 @@ local state = {
     territoryColor="Purple", fishColor="Blue", deadAnimalColor="Red",
     legendaryColor="Yellow", tracerColor="Cyan", thunderstruckColor="Yellow",
     tracerThickness=1, tracerTransparency=0.15, labelSize=13,
-    maxDistance=0, updateInterval=0.1, maxLabels=50,
+    updateInterval=0.1, espRenderDistance=3000,
+    graphicsNoShadows=false, graphicsReduceEffects=false, graphicsNoPostEffects=false,
+    graphicsHideTextures=false, graphicsLowWater=false,
     chamsEnabled=false, fullBrightLevel=0,
     espBodyHighlight={},
     silentAim=false, targetPlayers=false, targetAnimals=false, targetNPCs=false,
-    silentAimPrediction=true,          -- NEW
-    silentAimPredictionStrength=1.0,   -- NEW
+    silentAimPrediction=true,
+    silentAimPredictionStrength=1.0,
     targetPart="Head", fov=90, visibilityCheck=false,
     noRecoil=false, noSpread=false, infiniteAmmo=false, instantReload=false,
     gravityEnabled=false, gravityValue=196.2,
@@ -87,6 +401,9 @@ local state = {
     chamsResetInProgress=false,
     suppressErrors=false,
     showPlants=false,
+
+    
+    
 }
 
 local DEFAULT_STATE = {}
@@ -139,7 +456,11 @@ local PLAYER_BODY_GROUPS = {
 local uiHandles = { checkboxes={}, dropdowns={}, sliders={}, textboxes={}, checklists={} }
 
 local ESP, CHAR, COMBAT, HOOKS, AMMO, FB, CFG, INV, Physics, Water = {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+local legacyReport
+local initErrors={}
 local Adapter = { plants={}, npcByRig=setmetatable({}, {__mode="k"}) }
+local Graphics = {}
+local Drawing = Drawing
 local ownedConnections, ownedInstances = {}, {}
 local stopAll, destroyRuntime
 local function connect(signal, callback)
@@ -153,6 +474,8 @@ local function own(instance)
     table.insert(ownedInstances, instance)
     return instance
 end
+
+local function initDrawing() Drawing=OverlayFactory(S,own,Drawing) end
 
 -- ====== SAVE/LOAD ======
 local _loadingConfig = false
@@ -182,7 +505,7 @@ local function validProfileName(name)
         and name:match("^[%w_%- ]+$") ~= nil and name:match("%S") ~= nil
 end
 local NUMBER_LIMITS = {
-    updateInterval={0.05,1}, maxDistance={0,5000}, maxLabels={1,500},
+    updateInterval={0.03,1}, espRenderDistance={100,15000},
     tracerThickness={1,5}, tracerTransparency={0,1}, labelSize={10,20},
     fov={1,180}, silentAimPredictionStrength={0,3}, gravityValue={83,500},
     hipHeightValue={1,10}, speedValue={1,45}, fullBrightLevel={0,5},
@@ -231,7 +554,7 @@ local function LoadStateFromConfig(name)
     for _, key in ipairs({"espEnabled","silentAim","noRecoil","noSpread","infiniteAmmo","instantReload",
         "infiniteStamina","antiRagdoll","antiFallDamage","infiniteHorseStamina","alwaysDay",
         "gravityEnabled","hipHeightEnabled","speedEnabled","walkUnderWater","allowGunsUnderWater",
-        "highlightGoldBars"}) do state[key] = false end
+        "highlightGoldBars","graphicsNoShadows","graphicsReduceEffects","graphicsNoPostEffects","graphicsHideTextures","graphicsLowWater"}) do state[key] = false end
     state.fullBrightLevel = 0
     state.currentConfig = name
     ESP.lastUpdate = 0
@@ -380,9 +703,10 @@ local function initFOV()
     local function update()
         if not ring then return end
         S.Camera = S.Workspace.CurrentCamera or S.Camera
+        if not S.Camera then return end
         local vp = S.Camera.ViewportSize
         ring.Position = Vector2.new(vp.X/2, vp.Y/2)
-        ring.Radius = (state.fov / 90) * 200
+        ring.Radius = math.tan(math.rad(math.min(state.fov,178)*0.5)) / math.tan(math.rad(S.Camera.FieldOfView*0.5)) * vp.Y*0.5
         ring.Visible = state.showFOVRing and state.silentAim
     end
     ESP.createFOV = create
@@ -707,13 +1031,6 @@ local function initESP()
     ESP.lastUpdate = 0
     local goldBarHighlights = {}
 
-    local CHAMS_TRACER_MAX_DIST = 500
-
-    local REGIONS = {
-        "REGION_Swamp","REGION_BearpawValley","REGION_Desert","REGION_Forest",
-        "REGION_ForestOfBones","REGION_Highlands","REGION_Hills","REGION_Mountains",
-        "REGION_Plains","REGION_Plantation","REGION_RaiderCanyons","REGION_Silverhills",
-    }
 
     local function getFolder(path)
         local cached = folderCache[path]
@@ -796,7 +1113,7 @@ local function initESP()
         local seen = {}
         for _, container in ipairs(goldBarsFolder:GetChildren()) do
             local bar = container:FindFirstChild("GoldBar")
-            if bar and bar:IsA("BasePart") then
+            if bar and bar:IsA("BasePart") and S.Camera and (bar.Position-S.Camera.CFrame.Position).Magnitude<=state.espRenderDistance then
                 seen[bar] = true
                 if not goldBarHighlights[bar] then
                     local hl = Instance.new("Highlight")
@@ -895,8 +1212,10 @@ local function initESP()
         return Vector2.new(sp.X, sp.Y), on
     end
     local function getDistance(part)
-        if not part then return math.huge end
-        return (part.Position - S.Camera.CFrame.Position).Magnitude
+        if not part or not S.Camera then return nil end
+        local distance=(part.Position - S.Camera.CFrame.Position).Magnitude
+        if distance~=distance or distance>state.espRenderDistance then return nil end
+        return distance
     end
 
     local HORSE_KW = {"horse","mule","donkey","reindeer","mustang","appaloosa","arabian","shire","clydesdale","pony","foal","colt","filly","gelding","mare","stallion","skeleton horse","tennessee","quarter","friesian","andalusian","paint","morgan","percheron","belgian","haflinger","pinto"}
@@ -1012,7 +1331,7 @@ local function initESP()
         t.From = Vector2.new(0, 0)
         t.To = Vector2.new(0, 0)
         t.Thickness = math.max(1, state.tracerThickness or 1)
-        t.Transparency = state.tracerTransparency or 0.15
+        t.Transparency = 1-(state.tracerTransparency or 0.15)
         t.Color = COLOR_PRESETS[state.tracerColor] or Color3.fromRGB(0,255,255)
         t.Visible = false
         pcall(function() t.ZIndex = 2 end)
@@ -1051,6 +1370,7 @@ local function initESP()
         delay = delay or 0.05
         local count = 0
         for _, esp in pairs(espObjects) do
+            if state.destroyed then return end
             if esp.chams and next(esp.chams) then
                 for _, hl in pairs(esp.chams) do
                     pcall(function() hl:Destroy() end)
@@ -1073,6 +1393,7 @@ local function initESP()
                 end
             end
             for _, esp in ipairs(list) do
+                if state.destroyed then return end
                 for _, hl in pairs(esp.chams) do
                     pcall(function() hl:Destroy() end)
                 end
@@ -1157,6 +1478,7 @@ local function initESP()
         if state.chamsResetInProgress then return end
 
         local parts = getHighlightPartsForModel(m, entityType or esp.entityType, isLegendary)
+        while #parts>4 do table.remove(parts) end
         if #parts == 0 then
             for _, hl in pairs(esp.chams) do if hl then hl.Enabled = false end end
             return
@@ -1203,10 +1525,12 @@ local function initESP()
         local showT = params.showTracers
         if showT == nil then showT = state.showTracers end
 
+        local adornee=(char and char:IsA("Model")) and char or part
         if not esp.highlight or not esp.highlight.Parent then
             esp.highlight = createHighlight(part, color, hTrans)
+            if esp.highlight then esp.highlight.Adornee=adornee end
         elseif esp.highlight then
-            esp.highlight.Adornee = part
+            esp.highlight.Adornee = adornee
             esp.highlight.FillColor = color
             esp.highlight.OutlineColor = color
             esp.highlight.FillTransparency = hTrans
@@ -1228,13 +1552,13 @@ local function initESP()
             esp.label.Text = table.concat(tp, " | ")
             esp.label.Color = color
             esp.label.Position = Vector2.new(sp.X, sp.Y - 35)
-            esp.label.Visible = true
+            esp.label.Visible = #tp>0
         else
             esp.label.Visible = false
         end
 
         if esp.tracer then esp.tracer.Visible = false end
-        local distOk = (dist and dist <= CHAMS_TRACER_MAX_DIST) or (dist == nil)
+        local distOk = true
         if isPlayer and showT and distOk and part then
             local feetWorld = part.Position - Vector3.new(0, ho, 0)
             local feetSp3 = S.Camera:WorldToViewportPoint(feetWorld)
@@ -1246,40 +1570,29 @@ local function initESP()
                 esp.tracer.To           = Vector2.new(feetSp3.X, feetSp3.Y)
                 esp.tracer.Color        = COLOR_PRESETS[state.tracerColor] or Color3.fromRGB(0,255,255)
                 esp.tracer.Thickness    = math.max(1, state.tracerThickness or 1)
-                esp.tracer.Transparency = state.tracerTransparency or 0.15
+                esp.tracer.Transparency = 1-(state.tracerTransparency or 0.15)
                 pcall(function() esp.tracer.ZIndex = 2 end)
                 esp.tracer.Visible      = true
             end
         end
     end
 
-    local function isThunderstruckName(name)
-        if not name then return false end
-        local n = name:lower()
-        return n:find("thunderstruck", 1, true) ~= nil or n:find("thunder", 1, true) ~= nil
-    end
+    local function isThunderstruckName(name) return name=="Thunderstruck" end
     local function updateThunderstruck(active)
         if not state.showThunderstruck then return end
-        local geo = getFolder("WORKSPACE_Geometry")
-        if not geo then return end
-        for _, regionName in ipairs(REGIONS) do
-            local region = geo:FindFirstChild(regionName)
-            if region then
-                for _, obj in ipairs(region:GetDescendants()) do
-                    if (obj:IsA("Model") or obj:IsA("Folder")) and isThunderstruckName(obj.Name) then
-                        local p = (obj:IsA("Model") and getTargetPart(obj)) or obj:FindFirstChildWhichIsA("BasePart", true)
-                        if p then
-                            local d = getDistance(p)
-                            if state.maxDistance == 0 or d <= state.maxDistance then
-                                active[obj] = true
-                                local esp = getESP(obj)
-                                esp.entityType = "thunderstruck"
-                                local c = COLOR_PRESETS[state.thunderstruckColor] or Color3.fromRGB(255,255,60)
-                                renderEntityESP(esp, p, {color=c, heightOffset=4, showHealthData=false,
-                                    name="⚡ "..obj.Name, distance=d, showTracers=false})
-                            end
-                        end
-                    end
+        local definitions=Global and Global.SharedData and Global.SharedData.TreeInfo or {}
+        for _,model in ipairs(S.CollectionService:GetTagged("Thunderstruck")) do
+            if model:IsA("Model") and model:IsDescendantOf(S.Workspace) then
+                local info=model:FindFirstChild("TreeInfo")
+                local health=info and info:FindFirstChild("Health")
+                local part=getTargetPart(model)
+                local distance=part and getDistance(part)
+                if distance and health and health.Value>0 then
+                    active[model]=true
+                    local esp=getESP(model);esp.entityType="thunderstruck"
+                    local definition=definitions[model.Name]
+                    renderEntityESP(esp,part,{color=COLOR_PRESETS[state.thunderstruckColor],heightOffset=4,
+                        name="⚡ "..(definition and definition.Name or model.Name),distance=distance,showTracers=false})
                 end
             end
         end
@@ -1295,11 +1608,13 @@ local function initESP()
                     for _, hl in pairs(esp.chams) do if hl then hl.Enabled = false end end
                 end
             end
-            if not state.highlightGoldBars then updateGoldBars() end
+            updateGoldBars()
             return
         end
         local now = os.clock()
         if now - ESP.lastUpdate < state.updateInterval then return end
+        S.Camera=S.Workspace.CurrentCamera or S.Camera
+        if not S.Camera then return end
         ESP.lastUpdate = now
         local active = {}
 
@@ -1311,18 +1626,18 @@ local function initESP()
                         local root = getRoot(char)
                         if root then
                             local d = getDistance(root)
-                            if state.maxDistance == 0 or d <= state.maxDistance then
+                            if d then
                                 local p = getTargetPart(char)
                                 if p then
                                     active[char] = true
                                     local esp = getESP(char)
                                     esp.entityType = "player"
                                     local c = COLOR_PRESETS[state.playerColor] or Color3.fromRGB(60,255,60)
-                                    local within500 = (d <= CHAMS_TRACER_MAX_DIST)
-                                    renderEntityESP(esp, p, {color=c, heightOffset=2, showHealthData=false,
+                                    local showBodyEffects = true
+                                    renderEntityESP(esp, p, {color=c, heightOffset=2, showHealthData=true,
                                         character=char, name=player.Name, distance=d,
-                                        showTracers=(state.showTracers and within500)})
-                                    if within500 then
+                                        showTracers=(state.showTracers and showBodyEffects)})
+                                    if showBodyEffects then
                                         renderChams(esp, char, c, "player", false)
                                     elseif esp.chams then
                                         for _, hl in pairs(esp.chams) do if hl then hl.Enabled = false end end
@@ -1344,14 +1659,14 @@ local function initESP()
                     if rig and isAlive(rig) then
                         local part = getTargetPart(rig)
                         local distance = part and getDistance(part)
-                        if distance and (state.maxDistance == 0 or distance <= state.maxDistance) then
+                        if distance then
                             active[container] = true
                             local esp = getESP(container)
                             esp.entityType = "npc"
                             local color = COLOR_PRESETS[state.npcColor] or COLOR_PRESETS.Purple
                             renderEntityESP(esp, part, {color=color, heightOffset=2, showHealthData=true,
                                 character=rig, name=container.Name, distance=distance, showTracers=false})
-                            if distance <= CHAMS_TRACER_MAX_DIST then renderChams(esp, rig, color, "npc", false) end
+                            renderChams(esp, rig, color, "npc", false)
                         end
                     end
                 end
@@ -1383,7 +1698,7 @@ local function initESP()
                             local p = getTargetPart(animal)
                             if p then
                                 local d = getDistance(p)
-                                if state.maxDistance == 0 or d <= state.maxDistance then
+                                if d then
                                     active[animal] = true
                                     local esp = getESP(animal)
                                     esp.entityType = isH and "horse" or "animal"
@@ -1394,8 +1709,8 @@ local function initESP()
                                     renderEntityESP(esp, p, {color=c, heightOffset=2, showHealthData=true,
                                         character=animal, name=animal.Name, distance=d,
                                         isLegendary=isLeg, showTracers=false})
-                                    local within500 = (d <= CHAMS_TRACER_MAX_DIST)
-                                    if within500 then
+                                    local showBodyEffects = true
+                                    if showBodyEffects then
                                         renderChams(esp, animal, c, esp.entityType, isLeg)
                                     elseif esp.chams then
                                         for _, hl in pairs(esp.chams) do if hl then hl.Enabled = false end end
@@ -1423,7 +1738,7 @@ local function initESP()
                                 local p = getTargetPart(oreM)
                                 if p then
                                     local d = getDistance(p)
-                                    if state.maxDistance == 0 or d <= state.maxDistance then
+                                    if d then
                                         active[oreM] = true
                                         local esp = getESP(oreM)
                                         esp.entityType = "ore"
@@ -1471,7 +1786,7 @@ local function initESP()
                     elseif item:IsA("BasePart") then p = item end
                     if p then
                         local d = getDistance(p)
-                        if state.maxDistance == 0 or d <= state.maxDistance then
+                        if d then
                             active[item] = true
                             local esp = getESP(item)
                             esp.entityType = "item"
@@ -1512,7 +1827,7 @@ local function initESP()
                         local p = getTargetPart(chest)
                         if p then
                             local d = getDistance(p)
-                            if state.maxDistance == 0 or d <= state.maxDistance then
+                            if d then
                                 active[chest] = true
                                 local esp = getESP(chest)
                                 esp.entityType = "chest"
@@ -1534,7 +1849,7 @@ local function initESP()
                         local p = getTargetPart(train)
                         if p then
                             local d = getDistance(p)
-                            if state.maxDistance == 0 or d <= state.maxDistance then
+                            if d then
                                 active[train] = true
                                 local esp = getESP(train)
                                 esp.entityType = "train"
@@ -1556,7 +1871,7 @@ local function initESP()
                         local p = terr:FindFirstChildWhichIsA("BasePart", true)
                         if p then
                             local d = getDistance(p)
-                            if state.maxDistance == 0 or d <= state.maxDistance then
+                            if d then
                                 active[terr] = true
                                 local esp = getESP(terr)
                                 esp.entityType = "territory"
@@ -1578,7 +1893,7 @@ local function initESP()
                         local p = getTargetPart(fish)
                         if p then
                             local d = getDistance(p)
-                            if state.maxDistance == 0 or d <= state.maxDistance then
+                            if d then
                                 active[fish] = true
                                 local esp = getESP(fish)
                                 esp.entityType = "fish"
@@ -1600,7 +1915,7 @@ local function initESP()
                         local p = getTargetPart(dead)
                         if p then
                             local d = getDistance(p)
-                            if state.maxDistance == 0 or d <= state.maxDistance then
+                            if d then
                                 active[dead] = true
                                 local esp = getESP(dead)
                                 esp.entityType = "deadAnimal"
@@ -1617,7 +1932,7 @@ local function initESP()
         local function marker(key, part, name, color)
             if not part or not part:IsA("BasePart") or not part:IsDescendantOf(S.Workspace) then return end
             local distance = getDistance(part)
-            if state.maxDistance > 0 and distance > state.maxDistance then return end
+            if not distance then return end
             active[key] = true
             local esp = getESP(key)
             esp.entityType = "event"
@@ -1640,9 +1955,19 @@ local function initESP()
     end
 
     ESP.update = function()
+        if state.espEnabled and os.clock()-ESP.lastUpdate<state.updateInterval then return end
+        local started=os.clock()
         local ok, err = pcall(updateESPInternal)
+        local elapsed=(os.clock()-started)*1000
+        ESP.diagnostics=ESP.diagnostics or {updates=0,maxMs=0,lastMs=0,totalMs=0}
+        ESP.diagnostics.updates+=1;ESP.diagnostics.lastMs=elapsed
+        ESP.diagnostics.totalMs+=elapsed;ESP.diagnostics.meanMs=ESP.diagnostics.totalMs/ESP.diagnostics.updates
+        ESP.diagnostics.maxMs=math.max(ESP.diagnostics.maxMs,elapsed)
         if not ok then
-            warn("[TWW] ESP.update error: "..tostring(err))
+            ESP.diagnostics.lastError=tostring(err)
+            if os.clock()-(ESP.lastErrorLog or -math.huge)>=3 then
+                ESP.lastErrorLog=os.clock();warn("[TWW] ESP.update error: "..tostring(err))
+            end
         end
     end
 
@@ -1758,12 +2083,16 @@ end
 
 local function initChar()
     local PC = nil
-    local Orig = {}
     local NetHooked = false
+    local networkRecord
+    local fallProtection={blockedSelf=0,blockedImpacts=0,hookRepairs=0,installed=false}
+    CHAR.fallProtection=fallProtection
+    local ragdollProtection={installed=false,blocked=0,blockedFalls=0,recoveries=0}
+    CHAR.ragdollProtection=ragdollProtection
     local PinnedHorse = nil
-    local pinnedState
+    local pinnedStates={}
+    local staminaMethods={}
     local ready = false
-    local PIN_MT
     local ragdollGuard
     local nativeOwner, nativeMethods, nativeAttemptedOwner
     local pendingLegacyRecovery = false
@@ -1787,116 +2116,141 @@ local function initChar()
             {placeId=game.PlaceId,jobId=game.JobId})
         if not methods or state.destroyed or Global.PlayerCharacter ~= pc then
             CHAR.lastRagdollRecoveryError = err or "Character changed during native callback recovery."
+            ragdollProtection.error=CHAR.lastRagdollRecoveryError
             warn("[TWW] " .. CHAR.lastRagdollRecoveryError)
             return false
         end
         for name, fn in pairs(methods) do
             local owner = name == "EnterRagdoll" and Global.Ragdolls or name == "FireServer" and Global.Network or pc
             ensureWritable(owner)
-            if name == "FireServer" and NetHooked then Orig.FireServer = fn else owner[name] = fn end
+            -- An active owned wrapper already has its own forwarder. Preserve newer wrappers around it.
+            if name ~= "FireServer" or not NetHooked then owner[name] = fn end
         end
         nativeOwner, nativeMethods = pc, methods
         pendingLegacyRecovery = legacy
         return true
     end
-    local function looksLikeOriginal(f)
-        if typeof(f) ~= "function" then return false end
-        return true
-    end
     local function refreshPC()
-        local pc = Global.PlayerCharacter
-        if typeof(pc) == "table" and pc ~= PC then
-            PC = pc
-            if looksLikeOriginal(pc.LowerStamina) then
-                Orig.LowerStamina = pc.LowerStamina
-                Orig.LocalLowerStamina = pc.LocalLowerStamina
-            end
-        end
+        local pc=Global.PlayerCharacter
+        if type(pc)=="table" then PC=pc end
         return PC
     end
 
     local function hookFireServer()
         local Network = Global.Network
+        if type(Network)~="table" or type(Network.FireServer)~="function" then return false end
+        if NetHooked and networkRecord and networkRecord.owner==Network and Network.FireServer==networkRecord.wrapper then return true end
         ensureWritable(Network)
-        if not Orig.FireServer then Orig.FireServer = Network.FireServer end
-        if NetHooked then return end
-        NetHooked = true
-        Network.FireServer = function(self, eventName, ...)
-            if state.antiRagdoll then
-                if eventName == "DamageSelf" then return end
+        if networkRecord then
+            fallProtection.hookRepairs+=1
+            if networkRecord.owner~=Network and networkRecord.owner.FireServer==networkRecord.wrapper then
+                networkRecord.owner.FireServer=networkRecord.original
             end
-            if state.antiFallDamage and not state.antiRagdoll then
-                if eventName == "DamageSelf" then return end
-            end
-            if state.infiniteStamina and eventName == "LowerStamina" then return end
-            return Orig.FireServer(self, eventName, ...)
         end
+        -- Each wrapper keeps its own forwarder: a foreign wrapper can still hold an older TWW hook.
+        local record={owner=Network,original=Network.FireServer}
+        record.wrapper=function(self,eventName,...)
+            if not state.destroyed then
+                if eventName=="DamageSelf" and (state.antiFallDamage or state.antiRagdoll) then
+                    fallProtection.blockedSelf+=1
+                    return
+                end
+                if eventName=="RagdollImpact" and state.antiFallDamage and type(Network.GetObject)=="function" then
+                    local pc=Global.PlayerCharacter
+                    local character=pc and pc.Character
+                    local ok,part=pcall(Network.GetObject,Network,select(1,...),"CharacterPart")
+                    if ok and part and character then
+                        local resolved,owned=pcall(function()return part:IsDescendantOf(character)end)
+                        if resolved and owned then
+                            fallProtection.blockedImpacts+=1
+                            return
+                        end
+                    end
+                end
+                if state.infiniteStamina and eventName=="LowerStamina" then return end
+            end
+            return record.original(self,eventName,...)
+        end
+        networkRecord=record
+        Network.FireServer=record.wrapper
+        NetHooked=true;fallProtection.installed=true
+        return true
     end
     local function unhookFireServer()
-        if not NetHooked then return end
-        NetHooked = false
-        if Orig.FireServer then
-            ensureWritable(Global.Network)
-            Global.Network.FireServer = Orig.FireServer
+        if networkRecord and networkRecord.owner.FireServer==networkRecord.wrapper then
+            ensureWritable(networkRecord.owner)
+            networkRecord.owner.FireServer=networkRecord.original
         end
+        networkRecord=nil
+        NetHooked=false;fallProtection.installed=false
     end
     CHAR.hookFireServer = hookFireServer
     CHAR.unhookFireServer = unhookFireServer
 
+    local function pinStamina(ps)
+        if type(ps)~="table" then return true end
+        local record=pinnedStates[ps]
+        if record and getmetatable(ps)~=record.proxy then
+            -- Another controller replaced this state. Do not stack proxies.
+            return false
+        end
+        if not record then
+            ensureWritable(ps)
+            local originalMT=getmetatable(ps)
+            if originalMT~=nil and type(originalMT)~="table" then return false end
+            local proxy=originalMT and table.clone(originalMT) or {}
+            local index=originalMT and originalMT.__index
+            local newIndex=originalMT and originalMT.__newindex
+            record={original=originalMT,value=rawget(ps,"Stamina"),proxy=proxy}
+            proxy.__index=function(t,key)
+                if key=="Stamina" then return 100 end
+                if type(index)=="function" then return index(t,key) end
+                if type(index)=="table" then return index[key] end
+            end
+            proxy.__newindex=function(t,key,value)
+                if key=="Stamina" then record.value=value;return end
+                if type(newIndex)=="function" then newIndex(t,key,value)
+                elseif type(newIndex)=="table" then newIndex[key]=value
+                else rawset(t,key,value) end
+            end
+            if not pcall(setmetatable,ps,proxy) then return false end
+            pinnedStates[ps]=record
+        end
+        local latest=rawget(ps,"Stamina")
+        if latest~=nil then record.value=latest end
+        rawset(ps,"Stamina",nil)
+        return true
+    end
     local function applyInfiniteStamina()
         if not ready then return false end
-        local pc = refreshPC()
-        if not pc then return false end
-        ensureWritable(pc)
-        pc.LowerStamina = function() end
-        pc.LocalLowerStamina = function() end
-        local ps = Global.ReplicatedState.State
-        ensureWritable(ps)
-        if not pinnedState then
-            local originalMT = getmetatable(ps)
-            if originalMT ~= nil and type(originalMT) ~= "table" then return false end
-            PIN_MT = originalMT and table.clone(originalMT) or {}
-            local index = originalMT and originalMT.__index
-            local newIndex = originalMT and originalMT.__newindex
-            PIN_MT.__index = function(t, key)
-                if key == "Stamina" then return 100 end
-                if type(index) == "function" then return index(t, key) end
-                if type(index) == "table" then return index[key] end
-                return nil
-            end
-            PIN_MT.__newindex = function(t, key, value)
-                if key == "Stamina" then return end
-                if type(newIndex) == "function" then newIndex(t, key, value)
-                elseif type(newIndex) == "table" then newIndex[key] = value
-                else rawset(t, key, value) end
-            end
-            pinnedState = {state=ps,value=rawget(ps,"Stamina"),mt=originalMT}
-            if not pcall(setmetatable, ps, PIN_MT) then pinnedState = nil; PIN_MT = nil; return false end
+        local pc=refreshPC()
+        local replicated=Global.ReplicatedState
+        if not pc or not replicated or type(replicated.State)~="table" then return false end
+        local ok=pinStamina(replicated.State)
+        if type(pc.State)=="table" then ok=pinStamina(pc.State) and ok end
+        if not ok then return false end
+        if not staminaMethods[pc] then
+            ensureWritable(pc)
+            local hook=function() end
+            staminaMethods[pc]={lower=pc.LowerStamina,localLower=pc.LocalLowerStamina,hook=hook}
+            pc.LowerStamina=hook;pc.LocalLowerStamina=hook
         end
-        rawset(ps, "Stamina", nil)
-        pcall(function()
-            local sig = Global.ReplicatedState:GetStateChangedSignal("Stamina")
-            if sig and sig.Fire then sig:Fire() end
-        end)
         return true
     end
     local function removeInfiniteStamina()
-        if not ready then return end
-        local pc = PC or Global.PlayerCharacter
-        if typeof(pc) == "table" then
-            ensureWritable(pc)
-            if Orig.LowerStamina then pc.LowerStamina = Orig.LowerStamina end
-            if Orig.LocalLowerStamina then pc.LocalLowerStamina = Orig.LocalLowerStamina end
+        for pc,record in pairs(staminaMethods) do
+            if pc.LowerStamina==record.hook then pc.LowerStamina=record.lower end
+            if pc.LocalLowerStamina==record.hook then pc.LocalLowerStamina=record.localLower end
         end
-        if pinnedState then
-            local ps = pinnedState.state
-            if getmetatable(ps) == PIN_MT then
-                pcall(setmetatable, ps, pinnedState.mt)
-                rawset(ps, "Stamina", pinnedState.value)
+        table.clear(staminaMethods)
+        for ps,record in pairs(pinnedStates) do
+            if getmetatable(ps)==record.proxy then
+                local current=rawget(ps,"Stamina")
+                pcall(setmetatable,ps,record.original)
+                rawset(ps,"Stamina",if current~=nil then current else record.value)
             end
-            pinnedState = nil
-            PIN_MT = nil
         end
+        table.clear(pinnedStates)
     end
 
     -- Guard optional local starts, never the game's entry/exit or mount cleanup state machine.
@@ -1918,9 +2272,10 @@ local function initChar()
         if ragdollGuard then
             local record = ragdollGuard
             ensureWritable(record.owner)
-            if record.owner.Ragdoll == record.wrapper then record.owner.Ragdoll = record.original end
+            if record.owner.Ragdoll == record.wrapper then record.owner.Ragdoll = record.restore or record.original end
             ragdollGuard = nil
         end
+        ragdollProtection.installed=false
     end
     local function recoverRagdoll()
         if not ready or state.destroyed or not state.antiRagdoll or recoveryBusy then return false end
@@ -1968,40 +2323,51 @@ local function initChar()
             lastGetUp = os.clock()
             -- GetUp performs the native AttemptGetUp RPC and preserves cooldowns, animation and acknowledgement.
             pc:GetUp()
+            ragdollProtection.recoveries+=1
             return true
         end)
         recoveryBusy = false
         if not ok then
             CHAR.lastRagdollRecoveryError = tostring(attempted)
+            ragdollProtection.error=CHAR.lastRagdollRecoveryError
             warn("[TWW] Ragdoll recovery: " .. tostring(attempted))
             return false
         end
         CHAR.lastRagdollRecoveryError = nil
+        ragdollProtection.error=nil
         return attempted == true
     end
     local function applyAntiRagdoll()
-        if not ready then return false end
+        if not ready or state.destroyed then
+            ragdollProtection.error="Character protection is not ready."
+            return false
+        end
         local pc = refreshPC()
         if not pc or type(pc.Ragdoll) ~= "function" then return false end
         if ragdollGuard and (ragdollGuard.owner ~= pc or pc.Ragdoll ~= ragdollGuard.wrapper) then restoreRagdollGuard() end
         if not restoreNativeRagdollMethods(pc) then return false end
         if not ragdollGuard then
             local original = nativeMethods.Ragdoll
+            local restoreTo=pc.Ragdoll
             local function wrapper(self, ...)
-                -- UnMount(true) already detached the rider and passes this flag; its transition must finish.
-                local forcedTransition = select(2, ...) == true
+                -- Foot falls call Ragdoll(nil,true). UnMount(true) supplies the detached root part.
+                -- Only the latter needs to complete native entry before recovery.
+                local forcedTransition = select(2, ...) == true and select(1, ...) ~= nil
                 if self == pc and self == Global.PlayerCharacter and state.antiRagdoll and not state.destroyed
                     and not forcedTransition
                     and not self.IsDead and not self.IsTiedUp and not serverRagdolled(self)
                     and not localRagdolled(self.Character) and nativeFlag(self.HasFullControl, self) then
+                    ragdollProtection.blocked+=1
+                    if select(2,...)==true then ragdollProtection.blockedFalls+=1 end
                     return
                 end
                 return original(self, ...)
             end
             ensureWritable(pc)
             pc.Ragdoll = wrapper
-            ragdollGuard = {owner=pc,original=original,wrapper=wrapper}
+            ragdollGuard = {owner=pc,original=original,restore=restoreTo,wrapper=wrapper}
         end
+        ragdollProtection.installed=true;ragdollProtection.error=nil
         return true
     end
     local function removeAntiRagdoll()
@@ -2010,8 +2376,13 @@ local function initChar()
         lastGetUp = -math.huge
     end
 
-    local function applyAntiFallDamage() return true end
-    local function removeAntiFallDamage() return end
+    local function applyAntiFallDamage()
+        if not ready or state.destroyed then return false end
+        return hookFireServer()
+    end
+    local function removeAntiFallDamage()
+        if not state.antiFallDamage and not state.antiRagdoll and not state.infiniteStamina then unhookFireServer() end
+    end
 
     local function makeHorsePinMT(origMT)
         local origIndex = origMT and origMT.__index
@@ -2065,8 +2436,8 @@ local function initChar()
             applyAntiRagdoll()
         else
             removeAntiRagdoll()
-            if state.antiFallDamage then applyAntiFallDamage() else removeAntiFallDamage() end
         end
+        if state.antiFallDamage then applyAntiFallDamage() else removeAntiFallDamage() end
         if state.infiniteHorseStamina then applyHorseStamina() else removeHorseStamina() end
         if state.infiniteStamina or state.antiRagdoll or state.antiFallDamage then hookFireServer() else unhookFireServer() end
     end
@@ -2116,9 +2487,9 @@ local function initChar()
                         nextSync = os.clock() + 2
                         if Global.PlayerCharacter ~= PC then refreshPC() end
                         if state.infiniteStamina or state.antiRagdoll or state.antiFallDamage or state.infiniteHorseStamina then CHAR.sync() end
-                        if not NetHooked and (state.infiniteStamina or state.antiRagdoll or state.antiFallDamage) then hookFireServer() end
                     end
-                    if state.antiRagdoll then recoverRagdoll() end
+                    if state.infiniteStamina or state.antiRagdoll or state.antiFallDamage then hookFireServer() end
+                    if state.antiRagdoll then applyAntiRagdoll();recoverRagdoll() end
                 end)
             end
         end
@@ -2129,13 +2500,21 @@ end
 --  COMBAT
 -- =================================================================
 local function initCombat()
-    local COMBAT_MAX_DISTANCE = 1000
     local VALID_PLAYER_PARTS = {"Head","UpperTorso","LowerTorso","LeftUpperArm","LeftLowerArm","RightUpperArm","RightLowerArm","LeftUpperLeg","LeftLowerLeg","RightUpperLeg","RightLowerLeg","LeftHand","RightHand","LeftFoot","RightFoot"}
-    local PLAYER_FB = {Head={"Head","UpperTorso","LowerTorso"}, UpperTorso={"UpperTorso","LowerTorso","Head"}, LowerTorso={"LowerTorso","UpperTorso","Head"}}
-    local ANIMAL_FB = {Head={"Head","Skull","Body","Neck"}, UpperTorso={"Body","Head","Skull","Neck"}, LowerTorso={"Body","Head","Skull","LeftThigh","RightThigh"}}
+    local PLAYER_FB = {Head={"Head"}, UpperTorso={"UpperTorso","LowerTorso","Head"}, LowerTorso={"LowerTorso","UpperTorso","Head"}}
+    local ANIMAL_FB = {Head={"Head","Skull"}, UpperTorso={"Body","Head","Skull","Neck"}, LowerTorso={"Body","Head","Skull","LeftThigh","RightThigh"}}
     local ANIMAL_KW = {"head","skull","body","neck","leg","thigh","hoof","foot","arm","shoulder","paw"}
     local ANIMAL_EXCL = {"humanoidrootpart","eye","nose","snout","ear","antler","collision","hitbox"}
     local visParams = RaycastParams.new()
+    local lastTarget
+    local velocityHistory = setmetatable({}, {__mode="k"})
+    COMBAT.predictAim = function(origin, position, velocity, speed, gravity, platformVelocity)
+        local strength=state.silentAimPrediction and state.silentAimPredictionStrength or 0
+        if platformVelocity then velocity=(velocity or Vector3.new(0,0,0))*strength-platformVelocity;strength=1 end
+        local aim,time=Ballistics(origin,position,velocity or Vector3.new(0,0,0),speed,gravity,strength,3,Vector3.new)
+        COMBAT.prediction={time=time,speed=speed,velocity=velocity and velocity.Magnitude or 0,solved=aim~=nil}
+        return aim,time
+    end
     visParams.FilterType = Enum.RaycastFilterType.Exclude
     visParams.IgnoreWater = true
     local function nameMatches(name, kws)
@@ -2238,42 +2617,57 @@ local function initCombat()
         return result.Instance:IsDescendantOf(model)
     end
     COMBAT.getTargetVelocity = function(target)
-        local velocity = target.part.AssemblyLinearVelocity
-        if velocity and velocity.Magnitude >= 0.1 then return velocity end
-        local root = target.model and (target.model:FindFirstChild("HumanoidRootPart", true) or target.model:FindFirstChild("RootPart", true))
-        local rootVelocity = root and root.AssemblyLinearVelocity
-        if rootVelocity and rootVelocity.Magnitude >= 0.1 then return rootVelocity end
-        -- Interpolated NPC roots can be anchored: physics velocity is then zero.
-        local registry = Global and Global.ClientNPCs and Global.ClientNPCs.NPC_Map
-        local npc = target.kind == "NPC" and registry and registry[target.model]
-        if npc and npc.IsMoving == true and type(npc.ReplicatedMoveSpeed) == "number" then
-            local direction = npc.DirectionVector
-            local kind = typeof(direction)
-            local speed = npc.ReplicatedMoveSpeed
-            if (kind == "Vector3" or kind == "vector") and speed >= 0 and speed < math.huge then
-                return Vector3.new(direction.X, direction.Y, direction.Z) * speed
+        local velocity=target.part.AssemblyLinearVelocity
+        local root=target.model and (target.model:FindFirstChild("HumanoidRootPart",true) or target.model:FindFirstChild("RootPart",true))
+        local rootVelocity=root and root.AssemblyLinearVelocity
+        local registry=Global and Global.ClientNPCs and Global.ClientNPCs.NPC_Map
+        local npc=target.kind=="NPC" and registry and registry[target.model]
+        if rootVelocity and rootVelocity.Magnitude>0.1 then velocity=rootVelocity end
+        if not velocity or velocity.Magnitude<0.1 then
+            velocity=rootVelocity or velocity
+            if (not velocity or velocity.Magnitude<0.1) and npc and npc.IsMoving==true and type(npc.ReplicatedMoveSpeed)=="number" then
+                local direction=npc.DirectionVector
+                if (typeof(direction)=="Vector3" or typeof(direction)=="vector") and npc.ReplicatedMoveSpeed>=0 and npc.ReplicatedMoveSpeed<math.huge then
+                    velocity=Vector3.new(direction.X,direction.Y,direction.Z)*npc.ReplicatedMoveSpeed
+                end
             end
         end
-        return rootVelocity or velocity
+        local key=target.model or target.part
+        local now=os.clock();local previous=velocityHistory[key];local position=(root or target.part).Position
+        local dt=previous and now-previous.time
+        if previous and dt>=0 and dt<0.015 then
+            return (velocity and velocity.Magnitude>=0.1) and velocity or previous.velocity or Vector3.new(0,0,0)
+        end
+        if previous and dt>0.015 and dt<0.3 and (position-previous.position).Magnitude<30 then
+            if not velocity or velocity.Magnitude<0.1 then velocity=(position-previous.position)/dt end
+            if previous.velocity and velocity and velocity.Magnitude>0.1 and previous.velocity:Dot(velocity)>0 then
+                velocity=previous.velocity+(velocity-previous.velocity)*math.clamp(dt/0.04,0.5,1)
+            end
+        end
+        velocityHistory[key]={time=now,position=position,velocity=velocity}
+        return velocity or Vector3.new(0,0,0)
     end
     COMBAT.getBestTarget = function(origin)
-        if state.destroyed then return nil end
+        S.Camera=S.Workspace.CurrentCamera or S.Camera
+        if state.destroyed or not S.Camera then lastTarget=nil;return nil end
         local Entities = S.Workspace:FindFirstChild("WORKSPACE_Entities")
         if not Entities then return nil end
         local camCF = S.Camera.CFrame
         local camPos = camCF.Position
         local camLook = camCF.LookVector
         local halfFov = state.fov * 0.5
-        local maxDist = COMBAT_MAX_DISTANCE
         local best = nil
+        local retained
         local function evaluate(model, part, kind, name)
             if not part or not part:IsA("BasePart") then return end
             local toPart = part.Position - camPos
             local dist = toPart.Magnitude
-            if dist < 2 or dist > maxDist then return end
+            if dist < 0.001 or dist ~= dist or dist == math.huge then return end
             local angle = math.deg(math.acos(math.clamp(camLook:Dot(toPart.Unit), -1, 1)))
             if angle > halfFov then return end
             if state.visibilityCheck and not isVisible(origin, part, model) then return end
+            COMBAT.getTargetVelocity({model=model,part=part,kind=kind})
+            if lastTarget and model==lastTarget.model then retained={model=model,part=part,kind=kind,name=name,dist=dist,angle=angle} end
             if not best or angle < best.angle or (angle == best.angle and dist < best.dist) then
                 best = {model=model, part=part, kind=kind, name=name, dist=dist, angle=angle}
             end
@@ -2324,7 +2718,16 @@ local function initCombat()
                 end
             end
         end
+        if best and retained and retained.angle<=best.angle+1.5 then best=retained end
+        lastTarget=best
         return best
+    end
+    local nextSample=0
+    COMBAT.sample=function()
+        local now=os.clock();if now<nextSample then return end
+        nextSample=now+0.04
+        local origin=S.Camera and S.Camera.CFrame.Position
+        if origin then COMBAT.getBestTarget(origin) end
     end
 end
 
@@ -2333,77 +2736,70 @@ end
 -- =================================================================
 local function initHooks()
     local installed = false
+    local lastCombatLog=-math.huge
     local ProjectileHandler = Global and Global.ProjectileHandler
     local GameCamera = Global and Global.Camera
     local oldInitProjectiles = ProjectileHandler and ProjectileHandler.InitProjectiles
     local oldAddRecoil = GameCamera and GameCamera.AddRecoil
     local oldVibrate = GameCamera and GameCamera.Vibrate
+    local recoilHook=function() end
+    local vibrationHook=function() end
 
     HOOKS.applyNoRecoil = function(enabled)
         if type(GameCamera) ~= "table" then return end
         if enabled then
-            GameCamera.AddRecoil = function() end
-            GameCamera.Vibrate = function() end
+            GameCamera.AddRecoil = recoilHook
+            GameCamera.Vibrate = vibrationHook
         else
-            GameCamera.AddRecoil = oldAddRecoil
-            GameCamera.Vibrate = oldVibrate
+            if GameCamera.AddRecoil==recoilHook then GameCamera.AddRecoil = oldAddRecoil end
+            if GameCamera.Vibrate==vibrationHook then GameCamera.Vibrate = oldVibrate end
         end
     end
 
     local function initProjectilesHook(self, projType, sharedData, params, callback)
+        if not installed or state.destroyed then return oldInitProjectiles(self,projType,sharedData,params,callback) end
         if type(params) == "table"
             and typeof(params.origin) == "Vector3"
             and typeof(params.direction) == "Vector3" then
+            params=table.clone(params)
             local redirected = false
             if state.silentAim then
                 local okT, target = pcall(COMBAT.getBestTarget, params.origin)
                 if okT and target then
                     local aimPos = target.part.Position
 
-                    -- ============ MOVEMENT PREDICTION ============
-                    if state.silentAimPrediction and (state.silentAimPredictionStrength or 0) > 0 then
-                        -- 1. Target velocity (part first, then root fallback)
-                        local tVel = COMBAT.getTargetVelocity(target)
-
-                        if tVel then
-                            -- 2. Estimate projectile speed
-                            local projSpeed = 1000
-                            if type(sharedData) == "table" then
-                                if projType == "ArrowProjectile" or projType == "ServerArrowProjectile"
-                                    or projType == "DartProjectile" then
-                                    local power = params.power or 0.5
-                                    if params.ammoType == "ExplosiveArrow" then
-                                        local minE = sharedData.MinPowerExplosive or sharedData.MinPower or 100
-                                        local maxE = sharedData.MaxPowerExplosive or sharedData.MaxPower or 500
-                                        projSpeed = minE + (maxE - minE) * power
-                                    else
-                                        local minP = sharedData.MinPower or 100
-                                        local maxP = sharedData.MaxPower or 500
-                                        projSpeed = minP + (maxP - minP) * power
-                                    end
-                                elseif projType == "TomahawkProjectile" then
-                                    local power = params.power or 0.5
-                                    projSpeed = 80 + (200 - 80) * power
-                                elseif type(sharedData.ProjectilePower) == "number"
-                                    and sharedData.ProjectilePower > 0 then
-                                    projSpeed = sharedData.ProjectilePower
-                                end
-                            end
-                            if projSpeed <= 0 then projSpeed = 1000 end
-
-                            -- 3. Time-to-target and lead the shot
-                            local dist = (aimPos - params.origin).Magnitude
-                            local ttt  = dist / projSpeed
-                            aimPos = aimPos + tVel * (ttt * state.silentAimPredictionStrength)
+                    local canRedirect=true
+                    if COMBAT.predictAim then
+                        local speed,gravity
+                        if type(ProjectileHandler.GetProjectilePowerAndAccuracy)=="function" then
+                            local ok,value=pcall(ProjectileHandler.GetProjectilePowerAndAccuracy,ProjectileHandler,projType,sharedData,params)
+                            if ok then speed=value end
                         end
+                        if type(ProjectileHandler.GetProjectileGravity)=="function" then
+                            local ok,value=pcall(ProjectileHandler.GetProjectileGravity,ProjectileHandler,projType,sharedData)
+                            if ok and typeof(value)=="Vector3" then gravity=-value.Y end
+                        end
+                        if type(speed)=="number" and type(gravity)=="number" then
+                            local velocity=COMBAT.getTargetVelocity(target) or Vector3.new(0,0,0)
+                            local platform=projType=="TomahawkProjectile" and typeof(params.platformVelocity)=="Vector3" and params.platformVelocity or nil
+                            local predicted = COMBAT.predictAim(params.origin, aimPos, velocity, speed, gravity,platform)
+                            if predicted then aimPos=predicted else canRedirect=false end
+                        else canRedirect=false end
                     end
-                    -- ==============================================
 
                     local delta = aimPos - params.origin
-                    if delta.Magnitude > 0.01 then
+                    if canRedirect and delta.Magnitude > 0.01 then
                         params.direction = delta.Unit
+                        -- Native spread is applied after this hook. A selected aim point must survive it.
+                        params.accuracy=1
+                        if type(sharedData)=="table" then
+                            sharedData=table.clone(sharedData)
+                            sharedData.ProjectileAccuracy=if params.ammoType=="CoinShot" then 1.25 else 1
+                            sharedData.ShotgunRoundAccuracy=1;sharedData.SlugRoundAccuracy=1
+                        end
                         redirected = true
-                        if state.debugPrints then
+                        if state.debugPrints and os.clock()-lastCombatLog>=1 then
+                            lastCombatLog=os.clock()
                             print(string.format("[TWW] %s -> %s (%s) | %.1f° | %d studs | pred %.2fx",
                                 tostring(projType), tostring(target.name), target.kind,
                                 target.angle, math.floor(target.dist),
@@ -2414,9 +2810,6 @@ local function initHooks()
             end
             if state.noSpread then
                 if type(sharedData) == "table" then sharedData = table.clone(sharedData) end
-                if not redirected then
-                    params.direction = S.Camera.CFrame.LookVector
-                end
                 params.accuracy = 1
                 if typeof(params.spread) == "number" then params.spread = 0 end
                 if typeof(params.Spread) == "number" then params.Spread = 0 end
@@ -2470,20 +2863,11 @@ local function initHooks()
             if type(charge) ~= "number" or charge ~= charge then charge = 0 end
             local speed = settings.Speed * (1 + math.clamp(charge, 0, 1) * 0.5)
             local position = target.part.Position
-            local aimPosition = position
-            local velocity
-            if state.silentAimPrediction and (state.silentAimPredictionStrength or 0) > 0 then
-                velocity = COMBAT.getTargetVelocity(target)
-                if typeof(velocity) ~= "Vector3" then velocity = nil end
-            end
-            local gravity = type(settings.Gravity) == "number" and settings.Gravity or 0
-            if gravity ~= gravity or math.abs(gravity) >= math.huge then gravity = 0 end
-            -- Match the native charge-dependent speed and positionAt gravity used by WandUtils.
-            for _ = 1, 3 do
-                local flightTime = (aimPosition - origin).Magnitude / speed
-                aimPosition = position + Vector3.new(0, gravity * flightTime * flightTime * 0.5, 0)
-                if velocity then aimPosition += velocity * (flightTime * state.silentAimPredictionStrength) end
-            end
+            local velocity = state.silentAimPrediction and COMBAT.getTargetVelocity(target) or Vector3.new(0,0,0)
+            local gravity = type(settings.Gravity)=="number" and settings.Gravity or 0
+            if type(COMBAT.predictAim)~="function" then return nil end
+            local aimPosition=COMBAT.predictAim(origin,position,velocity,speed,gravity)
+            if not aimPosition then return nil end
             if (aimPosition - origin).Magnitude <= 0.01 then return nil end
             return aimPosition
         end)
@@ -2526,7 +2910,7 @@ local function initHooks()
             ProjectileHandler = Global and Global.ProjectileHandler
             oldInitProjectiles = ProjectileHandler and ProjectileHandler.InitProjectiles
         end
-        if ProjectileHandler then
+        if ProjectileHandler and type(oldInitProjectiles)=="function" then
             ProjectileHandler.InitProjectiles = initProjectilesHook
         end
         installWandAim()
@@ -2536,7 +2920,7 @@ local function initHooks()
         if not installed then return end
         installed = false
         removeWandAim()
-        if ProjectileHandler then
+        if ProjectileHandler and ProjectileHandler.InitProjectiles==initProjectilesHook then
             ProjectileHandler.InitProjectiles = oldInitProjectiles
         end
         HOOKS.applyNoRecoil(false)
@@ -2547,29 +2931,33 @@ end
 --  AMMO
 -- =================================================================
 local function initAmmo()
-    local TYPES = {"GunItemType","SidearmItemType","SideArmType","WeaponItemType"}
+    local TYPES = {"GunItemType"}
     local ourHooks = setmetatable({}, {__mode="k"})
     local wrappedClasses = setmetatable({}, {__mode="k"})
     local wrappedInstances = setmetatable({}, {__mode="k"})
     local installed = false
     local classRestores, instanceRestores = {}, setmetatable({}, {__mode="k"})
+    local ammoGeneration=0
+    local valueRestores=setmetatable({}, {__mode="k"})
+    local function writeOwned(object,key,value)
+        if rawget(object,key)==value then return end
+        local records=valueRestores[object]
+        if not records then records={};valueRestores[object]=records end
+        if not records[key] then records[key]={original=rawget(object,key)} end
+        rawset(object,key,value);records[key].last=value
+    end
     local function replaceMethod(class, key, original, hook)
         table.insert(classRestores, {class=class,key=key,original=original,hook=hook})
         class[key] = hook
     end
     local function isWeapon(t)
         if type(t) ~= "table" then return false end
-        if rawget(t, "Ammo") == nil and rawget(t, "MaxAmmo") == nil then
-            local ok1, v1 = pcall(function() return t.Ammo end)
-            if not ok1 or v1 == nil then return false end
-            local ok2, v2 = pcall(function() return t.MaxAmmo end)
-            if not ok2 or v2 == nil then return false end
-        end
-        return true
+        local max = rawget(t, "MaxAmmo")
+        return t.Owner==true and type(rawget(t, "Ammo")) == "number" and type(max) == "number" and max > 0
     end
     local function clearReloadFlags(self)
-        for _, f in ipairs({"IsLoading","Reloading","IsReloading","NeedsReload","ReloadPending","ReloadRequested","ReloadNeeded","GlobalIsReloading"}) do
-            if rawget(self, f) ~= nil then rawset(self, f, false) end
+        for _, f in ipairs({"IsLoading"}) do
+            if rawget(self, f) ~= nil then writeOwned(self, f, false) end
         end
     end
     local function fillChamber(self)
@@ -2579,15 +2967,15 @@ local function initAmmo()
         if type(cd) ~= "table" then return end
         local b = rawget(cd, "bullets")
         if type(b) ~= "table" then return end
-        for i = 1, #b do b[i] = "unused" end
-        if type(rawget(cd, "count")) == "number" and cd.count > 0 then rawset(cd, "index", 1) end
+        for i = 1, #b do writeOwned(b,i,"unused") end
+        if type(rawget(cd,"index"))~="number" or cd.index<1 or cd.index>#b then writeOwned(cd,"index",1) end
     end
     local function fillInstant(self)
         local max = rawget(self, "MaxAmmo")
         if type(max) ~= "number" or max <= 0 then return end
-        rawset(self, "Ammo", max)
+        writeOwned(self, "Ammo", max)
         local st = rawget(self, "State")
-        if type(st) == "table" then rawset(st, "Ammo", max); rawset(st, "MaxAmmo", max) end
+        if type(st)=="table" and rawget(st,"Ammo")~=nil then writeOwned(st,"Ammo",max) end
         fillChamber(self)
         clearReloadFlags(self)
     end
@@ -2596,16 +2984,18 @@ local function initAmmo()
         local max = rawget(self, "MaxAmmo")
         if type(max) ~= "number" or max <= 0 then return end
         if state.infiniteAmmo then
-            rawset(self, "Ammo", max)
+            writeOwned(self, "Ammo", max)
             local st = rawget(self, "State")
-            if type(st) == "table" then rawset(st, "Ammo", max); rawset(st, "MaxAmmo", max) end
+            if type(st)=="table" and rawget(st,"Ammo")~=nil then writeOwned(st,"Ammo",max) end
             fillChamber(self)
         end
-        if state.infiniteAmmo or state.instantReload then clearReloadFlags(self) end
+        if state.infiniteAmmo then clearReloadFlags(self) end
     end
     local function makeMT(origMT)
         local origIndex = origMT and origMT.__index
-        return {
+        local origNewIndex=origMT and origMT.__newindex
+        local proxy=type(origMT)=="table" and table.clone(origMT) or {}
+        local methods={
             __TWW_AMMO_PROXY = true,
             __index = function(t, key)
                 if state.infiniteAmmo and key == "Ammo" then
@@ -2625,24 +3015,36 @@ local function initAmmo()
                     local max = rawget(t, "MaxAmmo")
                     if type(max) == "number" and max > 0 and type(value) == "number" and value < max then return end
                 end
-                rawset(t, key, value)
+                if type(origNewIndex)=="function" then return origNewIndex(t,key,value)
+                elseif type(origNewIndex)=="table" then origNewIndex[key]=value
+                else rawset(t, key, value) end
             end,
         }
+        for key,value in pairs(methods) do proxy[key]=value end
+        return proxy
     end
     local function wrapInstance(inst)
-        if type(inst) ~= "table" or wrappedInstances[inst] then return end
+        if not installed or state.destroyed or not isWeapon(inst) or wrappedInstances[inst] then return end
         wrappedInstances[inst] = true
         local mt = getmetatable(inst)
-        if type(mt) == "table" and mt.__TWW_AMMO_PROXY then return end
+        if type(mt) == "table" and rawget(mt, "__TWW_AMMO_PROXY") then return end
         local proxy = makeMT(mt)
         if pcall(function() setmetatable(inst, proxy) end) then instanceRestores[inst] = {original=mt,proxy=proxy} end
     end
     local function findExisting()
-        if type(getgc) ~= "function" then return end
-        local ok, gc = pcall(getgc, true)
-        if not ok or type(gc) ~= "table" then return end
-        for _, obj in ipairs(gc) do
-            if isWeapon(obj) then wrapInstance(obj) end
+        -- Never inspect arbitrary GC objects: foreign __index callbacks can recurse or yield.
+        local pc = Global and Global.PlayerCharacter
+        if pc and type(pc.GetEquippedItem) == "function" then
+            local ok, item = pcall(pc.GetEquippedItem, pc)
+            if ok and isWeapon(item) then wrapInstance(item); forceFix(item) end
+        end
+        if pc and type(pc.GetItemsRaw) == "function" then
+            local ok, items = pcall(pc.GetItemsRaw, pc)
+            if ok and type(items) == "table" then
+                for _, item in pairs(items) do
+                    if isWeapon(item) then wrapInstance(item); forceFix(item) end
+                end
+            end
         end
     end
     local function wrapClass(cls)
@@ -2651,9 +3053,10 @@ local function initAmmo()
         local origNew = cls.new
         if type(origNew) == "function" and not ourHooks[origNew] then
             local newHook = function(self, ...)
-                local inst = origNew(self, ...)
-                if type(inst) == "table" then wrapInstance(inst) end
-                return inst
+                local token=ammoGeneration
+                local values = table.pack(origNew(self, ...))
+                if token==ammoGeneration and type(values[1]) == "table" then wrapInstance(values[1]) end
+                return table.unpack(values,1,values.n)
             end
             ourHooks[newHook] = true
             replaceMethod(cls, "new", origNew, newHook)
@@ -2662,18 +3065,37 @@ local function initAmmo()
             local orig = cls[mName]
             if type(orig) == "function" and not ourHooks[orig] then
                 local hook = function(self, ...)
-                    local r = orig(self, ...)
-                    if isWeapon(self) then forceFix(self) end
-                    return r
+                    local token=ammoGeneration
+                    local values = table.pack(orig(self, ...))
+                    if token==ammoGeneration and installed and not state.destroyed and isWeapon(self) then forceFix(self) end
+                    return table.unpack(values,1,values.n)
                 end
                 ourHooks[hook] = true
                 replaceMethod(cls, mName, orig, hook)
             end
         end
+        for _,name in ipairs({"CanShoot","IsDryFire","Fire"}) do
+            local original=cls[name]
+            if type(original)=="function" then
+                local hook=function(self,...)
+                    local active=installed and not state.destroyed and state.infiniteAmmo and isWeapon(self)
+                    if active then forceFix(self) end
+                    local token=ammoGeneration
+                    local results=table.pack(pcall(original,self,...))
+                    if active and token==ammoGeneration and installed and state.infiniteAmmo and not state.destroyed then forceFix(self) end
+                    if not results[1] then error(results[2],0) end
+                    return table.unpack(results,2,results.n)
+                end
+                replaceMethod(cls,name,original,hook)
+            end
+        end
         local origLoad = cls.Load
         if type(origLoad) == "function" and not ourHooks[origLoad] then
             local hook = function(self, ...)
-                if state.instantReload and isWeapon(self) then fillInstant(self); return end
+                if installed and not state.destroyed and state.instantReload and isWeapon(self) then
+                    if type(self.CanLoad)=="function" and not self:CanLoad() then return end
+                    fillInstant(self);return
+                end
                 return origLoad(self, ...)
             end
             ourHooks[hook] = true
@@ -2726,19 +3148,29 @@ local function initAmmo()
     AMMO.install = function()
         if installed then return true end
         if not Global then return false end
+        local started = os.clock()
+        ammoGeneration+=1
+        local token=ammoGeneration
+        installed = true
         local ok = pcall(function()
             for _, name in ipairs(TYPES) do
                 local ok2, cls = pcall(function() return Global:LoadModule(name) end)
+                if token~=ammoGeneration or not installed or state.destroyed then return end
                 if ok2 then wrapClass(cls) end
             end
             local wandOk, wand = pcall(function() return Global:LoadModule("WandItem") end)
+            if token~=ammoGeneration or not installed or state.destroyed then return end
             if wandOk then wrapWandClass(wand) end
         end)
+        if token~=ammoGeneration or not installed or state.destroyed then return false end
         pcall(findExisting)
-        installed = ok
+        if not ok then AMMO.uninstall() end
+        AMMO.diagnostics = {installed=installed, durationMs=(os.clock()-started)*1000, classHooks=#classRestores}
         return ok
     end
     AMMO.uninstall = function()
+        ammoGeneration+=1
+        installed=false
         for i = #classRestores, 1, -1 do
             local record = classRestores[i]
             if record.class[record.key] == record.hook then record.class[record.key] = record.original end
@@ -2748,9 +3180,14 @@ local function initAmmo()
             if getmetatable(instance) == record.proxy then pcall(setmetatable, instance, record.original) end
         end
         table.clear(instanceRestores)
+        for object,records in pairs(valueRestores) do
+            for key,record in pairs(records) do if rawget(object,key)==record.last then rawset(object,key,record.original) end end
+        end
+        table.clear(valueRestores)
         wrappedInstances = setmetatable({}, {__mode="k"})
         wrappedClasses = setmetatable({}, {__mode="k"})
         installed = false
+        AMMO.diagnostics = {installed=false,durationMs=0,classHooks=0}
     end
     AMMO.wrapExisting = findExisting
 end
@@ -2874,7 +3311,6 @@ local function initUI()
     local CombatTab    = Window:Folder("🎯 Combat")
     local UtilitiesTab = Window:Folder("🧍 Player")
     local ConfigTab    = Window:Folder("⚙️ Config")
-
     -- ================== MAIN ==================
     local master = MainTab:Section("⚡ Quick Controls")
     master:Label("Choose your ESP targets below. RightShift toggles this menu; J toggles Silent Aim.")
@@ -2896,6 +3332,16 @@ local function initUI()
         if stopAll then stopAll() end
         toast("All features stopped.", 2)
     end)
+
+    local rangeSec=MainTab:Section("ESP Performance")
+    uiHandles.sliders.espRenderDistance=rangeSec:Slider("Render Distance (studs)",100,15000,state.espRenderDistance,function(value)
+        if _loadingConfig then return end
+        state.espRenderDistance=math.clamp(value,100,15000);ESP.lastUpdate=0
+    end,100)
+    uiHandles.sliders.updateInterval=rangeSec:Slider("Update Interval (seconds)",0.03,1,state.updateInterval,function(value)
+        if not _loadingConfig then state.updateInterval=math.clamp(value,0.03,1) end
+    end,0.01)
+    rangeSec:Label("Range applies to all ESP targets. Only streamed objects can be displayed.")
 
     local function entToggle(section, label, key)
         uiHandles.checkboxes[key] = section:Checkbox(label, function(enabled)
@@ -2976,6 +3422,18 @@ local function initUI()
     dispToggle("📏 Distance", "showDistance")
     dispToggle("❤️ Health", "showHealth")
     dispToggle("〰️ Tracers", "showTracers")
+    local perfSec = VisualsTab:Section("📐 Display")
+    uiHandles.sliders.labelSize = perfSec:Slider("🔠 Label Size", 10, 20, state.labelSize, function(v)
+        if _loadingConfig then return end
+        state.labelSize = v
+        ESP.setLabelSize(v)
+    end, 1)
+    uiHandles.sliders.tracerThickness = perfSec:Slider("〰️ Tracer Width", 1, 5, state.tracerThickness,
+        function(v) if _loadingConfig then return end state.tracerThickness = v end, 1)
+    uiHandles.sliders.tracerTransparency = perfSec:Slider("👻 Tracer Transparency", 0, 1, state.tracerTransparency,
+        function(v) if _loadingConfig then return end state.tracerTransparency = v end, 0.05)
+
+
     local bodySec = VisualsTab:Section("✨ Body Highlights")
     bodySec:Label("Choose the body groups to emphasize. Legendary animals keep their gold highlight.")
     uiHandles.checkboxes.chamsEnabled = bodySec:Checkbox("✨ Enable Body Highlights", function(e)
@@ -3055,6 +3513,15 @@ local function initUI()
         end)
     end)
 
+    local oreSec = VisualsTab:Section("⛏️ Ore Details")
+    uiHandles.checkboxes.showOreCount = oreSec:Checkbox("🔢 Remaining Ore", function(enabled)
+        if not _loadingConfig then state.showOreCount = enabled end
+    end, state.showOreCount)
+    uiHandles.checkboxes.showOreTier = oreSec:Checkbox("💎 Ore Tier", function(enabled)
+        if not _loadingConfig then state.showOreTier = enabled end
+    end, state.showOreTier)
+
+
     local colorSec = VisualsTab:Section("🎨 Category Colors")
     local function colorDD(label, key)
         uiHandles.dropdowns[key] = colorSec:Dropdown(label, COLOR_OPTIONS, function(v)
@@ -3070,28 +3537,33 @@ local function initUI()
         {"Legendary Highlight","legendaryColor"},{"Tracer","tracerColor"},
     }) do colorDD(pair[1], pair[2]) end
 
-    local oreSec = VisualsTab:Section("⛏️ Ore Details")
-    uiHandles.checkboxes.showOreCount = oreSec:Checkbox("🔢 Remaining Ore", function(enabled)
-        if not _loadingConfig then state.showOreCount = enabled end
-    end, state.showOreCount)
-    uiHandles.checkboxes.showOreTier = oreSec:Checkbox("💎 Ore Tier", function(enabled)
-        if not _loadingConfig then state.showOreTier = enabled end
-    end, state.showOreTier)
+    local graphicsSec=VisualsTab:Section("Graphics & Performance")
+    for _,entry in ipairs({{"Disable Shadows","graphicsNoShadows"},{"Reduce Particles & Trails","graphicsReduceEffects"},
+        {"Disable Post Effects","graphicsNoPostEffects"},{"Hide Decals & Textures","graphicsHideTextures"},{"Simplify Water","graphicsLowWater"}}) do
+        local key=entry[2]
+        uiHandles.checkboxes[key]=graphicsSec:Checkbox(entry[1],function(enabled)
+            if _loadingConfig then return end
+            state[key]=enabled;Graphics.sync()
+        end,false)
+    end
+    graphicsSec:Label("Changes are local and restore when disabled or unloaded.")
 
-    local perfSec = VisualsTab:Section("📐 Range & Display")
-    uiHandles.sliders.maxDistance = perfSec:Slider("📏 ESP Range (0 = Unlimited)", 0, 5000, state.maxDistance,
-        function(v) if _loadingConfig then return end state.maxDistance = v end, 10)
-    uiHandles.sliders.updateInterval = perfSec:Slider("⏱️ Refresh Interval (seconds)", 0.05, 1, state.updateInterval,
-        function(v) if _loadingConfig then return end state.updateInterval = v end, 0.05)
-    uiHandles.sliders.labelSize = perfSec:Slider("🔠 Label Size", 10, 20, state.labelSize, function(v)
+
+    local fbSec = VisualsTab:Section("☀️ Full Bright")
+    fbSec:Label("Set brightness to 0 to restore the game's lighting.")
+    uiHandles.sliders.fullBrightLevel = fbSec:Slider("☀️ Brightness (0 = Off)", 0, 5, state.fullBrightLevel,
+        function(v)
+            if _loadingConfig then return end
+            FB.setLevel(v)
+        end, 1)
+
+    local timeSec = VisualsTab:Section("🌅 World Time")
+    uiHandles.checkboxes.alwaysDay = timeSec:Checkbox("🌤️ Always Daytime", function(e)
         if _loadingConfig then return end
-        state.labelSize = v
-        ESP.setLabelSize(v)
-    end, 1)
-    uiHandles.sliders.tracerThickness = perfSec:Slider("〰️ Tracer Width", 1, 5, state.tracerThickness,
-        function(v) if _loadingConfig then return end state.tracerThickness = v end, 1)
-    uiHandles.sliders.tracerTransparency = perfSec:Slider("👻 Tracer Transparency", 0, 1, state.tracerTransparency,
-        function(v) if _loadingConfig then return end state.tracerTransparency = v end, 0.05)
+        state.alwaysDay = e
+        if FB.applyTime then FB.applyTime() end
+    end, state.alwaysDay)
+
 
     -- ================== COMBAT ==================
     local aimCombatSec = CombatTab:Section("🎯 Silent Aim")
@@ -3146,7 +3618,7 @@ local function initUI()
         ESP.updateFOV()
     end, state.showFOVRing)
 
-    -- ==== Movement Prediction (NEW) ====
+    -- ==== Movement Prediction ====
     local predSec = CombatTab:Section("🏹 Movement Prediction")
     uiHandles.checkboxes.silentAimPrediction = predSec:Checkbox(
         "🏹 Lead Moving Targets", function(e)
@@ -3180,43 +3652,56 @@ local function initUI()
     uiHandles.checkboxes.infiniteAmmo = ammoSec:Checkbox("♾️ Infinite Ammo / Wand Mana", function(e)
         if _loadingConfig then return end
         state.infiniteAmmo = e
-        if e then AMMO.install(); AMMO.wrapExisting()
-        elseif not state.instantReload then AMMO.uninstall() end
+        if e and not AMMO.install() then state.infiniteAmmo=false;updateUIFromState();toast("Ammo hooks unavailable. Check Diagnostics.",3)
+        elseif not e and not state.instantReload then AMMO.uninstall() end
     end, state.infiniteAmmo)
-    ammoSec:Label("Wand: bypasses local mana checks. Server validation still applies.")
     uiHandles.checkboxes.instantReload = ammoSec:Checkbox("⚡ Instant Reload", function(e)
         if _loadingConfig then return end
         state.instantReload = e
-        if e then AMMO.install(); AMMO.wrapExisting()
-        elseif not state.infiniteAmmo then AMMO.uninstall() end
+        if e and not AMMO.install() then state.instantReload=false;updateUIFromState();toast("Reload hooks unavailable. Check Diagnostics.",3)
+        elseif not e and not state.infiniteAmmo then AMMO.uninstall() end
     end, state.instantReload)
+    ammoSec:Label("Wand: bypasses local mana checks. Server validation still applies.")
 
     -- ================== UTILITIES ==================
     local charSec = UtilitiesTab:Section("🛡️ Stamina & Protection")
     uiHandles.checkboxes.infiniteStamina = charSec:Checkbox("⚡ Infinite Stamina", function(e)
         if _loadingConfig then return end
         state.infiniteStamina = e
-        if e then CHAR.applyInfiniteStamina() else CHAR.removeInfiniteStamina() end
+        if e then
+            if not CHAR.applyInfiniteStamina() then
+                state.infiniteStamina=false;CHAR.removeInfiniteStamina();updateUIFromState()
+                toast("Stamina state is not ready or is protected. Try after spawning.",3)
+            end
+        else CHAR.removeInfiniteStamina() end
         CHAR.sync()
     end, state.infiniteStamina)
-    uiHandles.checkboxes.antiRagdoll = charSec:Checkbox("🛡️ Prevent Ragdoll", function(e)
-        if _loadingConfig then return end
-        state.antiRagdoll = e
-        if e then CHAR.applyAntiRagdoll(); CHAR.removeAntiFallDamage() else CHAR.removeAntiRagdoll() end
-        CHAR.sync()
-    end, state.antiRagdoll)
-    uiHandles.checkboxes.antiFallDamage = charSec:Checkbox("🪂 Prevent Fall Damage", function(e)
-        if _loadingConfig then return end
-        state.antiFallDamage = e
-        if e and not state.antiRagdoll then CHAR.applyAntiFallDamage() else CHAR.removeAntiFallDamage() end
-        CHAR.sync()
-    end, state.antiFallDamage)
     uiHandles.checkboxes.infiniteHorseStamina = charSec:Checkbox("🐎 Infinite Horse Stamina", function(e)
         if _loadingConfig then return end
         state.infiniteHorseStamina = e
         if e then CHAR.applyHorseStamina() else CHAR.removeHorseStamina() end
     end, state.infiniteHorseStamina)
 
+
+    uiHandles.checkboxes.antiRagdoll = charSec:Checkbox("🛡️ Prevent Ragdoll", function(e)
+        if _loadingConfig then return end
+        state.antiRagdoll = e
+        if e then
+            if not CHAR.applyAntiRagdoll() then
+                state.antiRagdoll=false;CHAR.removeAntiRagdoll();updateUIFromState()
+                toast(CHAR.ragdollProtection.error or "Ragdoll protection unavailable. Try after spawning.",4)
+            end
+        else CHAR.removeAntiRagdoll() end
+        CHAR.sync()
+    end, state.antiRagdoll)
+    charSec:Label("Blocks local falls and knockback. Server ragdolls use native recovery.")
+    uiHandles.checkboxes.antiFallDamage = charSec:Checkbox("🪂 Prevent Fall Damage", function(e)
+        if _loadingConfig then return end
+        state.antiFallDamage = e
+        if e then CHAR.applyAntiFallDamage() else CHAR.removeAntiFallDamage() end
+        CHAR.sync()
+    end, state.antiFallDamage)
+    charSec:Label("Fall protection includes ragdoll landing impacts.")
     local waterSec = UtilitiesTab:Section("🌊 Water")
     uiHandles.checkboxes.walkUnderWater = waterSec:Checkbox("🚶 Walk Underwater", function(e)
         if _loadingConfig then return end
@@ -3257,21 +3742,6 @@ local function initUI()
         state.speedValue = v
         if state.speedEnabled then Physics.setSpeed(true, v) end
     end, 1)
-
-    local fbSec = UtilitiesTab:Section("☀️ Full Bright")
-    fbSec:Label("Set brightness to 0 to restore the game's lighting.")
-    uiHandles.sliders.fullBrightLevel = fbSec:Slider("☀️ Brightness (0 = Off)", 0, 5, state.fullBrightLevel,
-        function(v)
-            if _loadingConfig then return end
-            FB.setLevel(v)
-        end, 1)
-
-    local timeSec = UtilitiesTab:Section("🌅 World Time")
-    uiHandles.checkboxes.alwaysDay = timeSec:Checkbox("🌤️ Always Daytime", function(e)
-        if _loadingConfig then return end
-        state.alwaysDay = e
-        if FB.applyTime then FB.applyTime() end
-    end, state.alwaysDay)
 
     -- ================== CONFIG ==================
     local profSec = ConfigTab:Section("💾 Saved Profiles")
@@ -3405,7 +3875,8 @@ local function initMain()
         if state.destroyed then return end
         for _, key in ipairs({"espEnabled","silentAim","noSpread","noRecoil","infiniteAmmo","instantReload",
             "infiniteStamina","antiRagdoll","antiFallDamage","infiniteHorseStamina","alwaysDay",
-            "gravityEnabled","hipHeightEnabled","speedEnabled","walkUnderWater","allowGunsUnderWater","highlightGoldBars"}) do
+            "gravityEnabled","hipHeightEnabled","speedEnabled","walkUnderWater","allowGunsUnderWater","highlightGoldBars",
+            "graphicsNoShadows","graphicsReduceEffects","graphicsNoPostEffects","graphicsHideTextures","graphicsLowWater"}) do
             state[key] = false
         end
         state.fullBrightLevel = 0
@@ -3416,6 +3887,7 @@ local function initMain()
         restore(CHAR.unhookFireServer)
         restore(HOOKS.uninstall)
         restore(AMMO.uninstall)
+        restore(Graphics.stop)
         restore(FB.stop)
         restore(Physics.stop)
         restore(INV.stop)
@@ -3461,8 +3933,20 @@ local function initMain()
             local kind = object.entityType or "unknown"
             objectsByType[kind] = (objectsByType[kind] or 0) + 1
         end
+        local connections=0
+        for _,connection in ipairs(ownedConnections) do if connection.Connected then connections+=1 end end
         return {active=state.active,destroyed=state.destroyed,features=features,objects=objects,
-            objectsByType=objectsByType,event=Adapter.snapshot and Adapter.snapshot() or {},profile=state.currentConfig}
+            objectsByType=objectsByType,event=Adapter.snapshot and Adapter.snapshot() or {},profile=state.currentConfig,
+            initErrors=initErrors,legacy=legacyReport,graphics=Graphics.status and Graphics.status(),ammo=AMMO.diagnostics,fallProtection=CHAR.fallProtection,ragdollProtection=CHAR.ragdollProtection,prediction=COMBAT.prediction,connections=connections,esp=ESP.diagnostics}
+    end
+    function controller:Configure(preferences)
+        assert(not state.destroyed and type(preferences)=="table","Expected settings table")
+        for key,value in pairs(preferences) do
+            if uiHandles.sliders[key] or key=="targetPart" then
+                local checked=savedValue(key,value);if checked~=nil then state[key]=checked end
+            end
+        end
+        ESP.lastUpdate=0;updateUIFromState()
     end
     function controller:LoadProfile(name)
         local loaded = LoadStateFromConfig(name)
@@ -3474,8 +3958,16 @@ local function initMain()
     renderConnection = connect(S.RunService.RenderStepped, function()
         if not state.active then return end
         S.Camera = S.Workspace.CurrentCamera or S.Camera
-        if ESP.update then ESP.update() end
         if ESP.updateFOV then ESP.updateFOV() end
+    end)
+    local espWasActive=false
+    connect(S.RunService.Heartbeat,function()
+        if not state.active then return end
+        if state.silentAim and COMBAT.sample then COMBAT.sample() end
+        if state.espEnabled or state.highlightGoldBars or espWasActive then
+            if ESP.update then ESP.update() end
+        end
+        espWasActive=state.espEnabled or state.highlightGoldBars
     end)
     if ESP.createFOV then ESP.createFOV() end
     local function refreshCharacter()
@@ -3504,11 +3996,16 @@ end
 local function safeInit(name, fn)
     local ok, err = pcall(fn)
     if not ok then
+        initErrors[name]=tostring(err)
         warn("[TWW] init "..name.." failed: "..tostring(err))
     end
+    return ok
 end
 
+safeInit("Legacy cleanup", function() legacyReport=LegacyRepair(S,Global) end)
 safeInit("CFG", initCFG)
+safeInit("Drawing", initDrawing)
+safeInit("Graphics", function() Graphics=GraphicsFactory(S,state,connect) end)
 safeInit("FB", initFB)
 safeInit("FOV", initFOV)
 safeInit("Physics", initPhysics)
@@ -3522,9 +4019,11 @@ safeInit("Ammo", initAmmo)
 safeInit("Inventory", initInventory)
 safeInit("WendigoAnnouncer", initWendigoAnnouncer)
 _loadingConfig = true
-safeInit("UI", initUI)
+local uiReady=safeInit("UI", initUI)
 _loadingConfig = false
-if not state.window then
+if not uiReady or not state.window then
+    safeInit("Main cleanup",initMain)
+    if destroyRuntime then destroyRuntime() end
     state.destroyed = true
     originalWarn("[TWW] UI initialization failed; runtime was not started.")
     return nil
