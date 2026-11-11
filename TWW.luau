@@ -391,7 +391,7 @@ local state = {
     silentAimPrediction=true,
     silentAimPredictionStrength=1.0,
     targetPart="Head", fov=90, visibilityCheck=false,
-    noRecoil=false, noSpread=false, infiniteAmmo=false, instantReload=false,
+    noRecoil=false, noSpread=false, infiniteAmmo=false, instantReload=false, noShootCooldown=false,
     gravityEnabled=false, gravityValue=196.2,
     hipHeightEnabled=false, hipHeightValue=2,
     speedEnabled=false, speedValue=16,
@@ -551,7 +551,7 @@ local function LoadStateFromConfig(name)
         if checked ~= nil then state[key] = checked end
     end
     -- Profiles store preferences, never a running automation or player modifier.
-    for _, key in ipairs({"espEnabled","silentAim","noRecoil","noSpread","infiniteAmmo","instantReload",
+    for _, key in ipairs({"espEnabled","silentAim","noRecoil","noSpread","infiniteAmmo","instantReload","noShootCooldown",
         "infiniteStamina","antiRagdoll","antiFallDamage","infiniteHorseStamina","alwaysDay",
         "gravityEnabled","hipHeightEnabled","speedEnabled","walkUnderWater","allowGunsUnderWater",
         "highlightGoldBars","graphicsNoShadows","graphicsReduceEffects","graphicsNoPostEffects","graphicsHideTextures","graphicsLowWater"}) do state[key] = false end
@@ -2472,7 +2472,7 @@ local function initChar()
         if state.destroyed then return end
         restoreNativeRagdollMethods(Global.PlayerCharacter)
         CHAR.sync()
-        if (state.infiniteAmmo or state.instantReload) and AMMO.install then AMMO.install() end
+        if (state.infiniteAmmo or state.instantReload or state.noShootCooldown) and AMMO.install then AMMO.install() end
         if Water then Water.reapply() end
     end)
 
@@ -3080,8 +3080,21 @@ local function initAmmo()
                 local hook=function(self,...)
                     local active=installed and not state.destroyed and state.infiniteAmmo and isWeapon(self)
                     if active then forceFix(self) end
+                    -- Native Shoot assigns the same numeric timestamp to both firing locks.
+                    -- Clear only that matched pair during eligibility, preserving real loading and other denials.
+                    local firingLock, globalLock
+                    if name=="CanShoot" and installed and not state.destroyed and state.noShootCooldown
+                        and isWeapon(self) and type(rawget(self,"IsReloading"))=="number"
+                        and rawget(self,"IsReloading")==rawget(self,"GlobalIsReloading") then
+                        firingLock,globalLock=self.IsReloading,self.GlobalIsReloading
+                        self.IsReloading=false;self.GlobalIsReloading=false
+                    end
                     local token=ammoGeneration
                     local results=table.pack(pcall(original,self,...))
+                    if firingLock then
+                        if self.IsReloading==false then self.IsReloading=firingLock end
+                        if self.GlobalIsReloading==false then self.GlobalIsReloading=globalLock end
+                    end
                     if active and token==ammoGeneration and installed and state.infiniteAmmo and not state.destroyed then forceFix(self) end
                     if not results[1] then error(results[2],0) end
                     return table.unpack(results,2,results.n)
@@ -3108,7 +3121,15 @@ local function initAmmo()
         local canCast, chargeAlpha = cls.CanCast, cls.GetChargeAlpha
         if type(canCast) == "function" then
             replaceMethod(cls, "CanCast", canCast, function(self, spellName, ...)
-                local values = table.pack(canCast(self, spellName, ...))
+                local castEnd
+                if installed and state.noShootCooldown and not state.destroyed and self.Owner==true
+                    and type(rawget(self,"CastEnd"))=="number" then
+                    castEnd=self.CastEnd;self.CastEnd=nil
+                end
+                local values = table.pack(pcall(canCast, self, spellName, ...))
+                if castEnd and self.CastEnd==nil then self.CastEnd=castEnd end
+                if not values[1] then error(values[2],0) end
+                table.remove(values,1);values.n-=1
                 if values[1] or not state.infiniteAmmo or state.destroyed or self.Owner ~= true then
                     return table.unpack(values, 1, values.n)
                 end
@@ -3648,18 +3669,25 @@ local function initUI()
         if e and HOOKS.install then HOOKS.install() end
     end, state.noSpread)
 
+    uiHandles.checkboxes.noShootCooldown = gunSec:Checkbox("⚡ No Shoot Cooldown", function(e)
+        if _loadingConfig then return end
+        state.noShootCooldown = e
+        if e and not AMMO.install() then state.noShootCooldown=false;updateUIFromState();toast("Weapon hooks unavailable. Check Diagnostics.",3)
+        elseif not e and not state.infiniteAmmo and not state.instantReload then AMMO.uninstall() end
+    end, state.noShootCooldown)
+
     local ammoSec = gunSec
     uiHandles.checkboxes.infiniteAmmo = ammoSec:Checkbox("♾️ Infinite Ammo / Wand Mana", function(e)
         if _loadingConfig then return end
         state.infiniteAmmo = e
         if e and not AMMO.install() then state.infiniteAmmo=false;updateUIFromState();toast("Ammo hooks unavailable. Check Diagnostics.",3)
-        elseif not e and not state.instantReload then AMMO.uninstall() end
+        elseif not e and not state.instantReload and not state.noShootCooldown then AMMO.uninstall() end
     end, state.infiniteAmmo)
     uiHandles.checkboxes.instantReload = ammoSec:Checkbox("⚡ Instant Reload", function(e)
         if _loadingConfig then return end
         state.instantReload = e
         if e and not AMMO.install() then state.instantReload=false;updateUIFromState();toast("Reload hooks unavailable. Check Diagnostics.",3)
-        elseif not e and not state.infiniteAmmo then AMMO.uninstall() end
+        elseif not e and not state.infiniteAmmo and not state.noShootCooldown then AMMO.uninstall() end
     end, state.instantReload)
     ammoSec:Label("Wand: bypasses local mana checks. Server validation still applies.")
 
@@ -3873,7 +3901,7 @@ local function initMain()
     end
     stopAll = function()
         if state.destroyed then return end
-        for _, key in ipairs({"espEnabled","silentAim","noSpread","noRecoil","infiniteAmmo","instantReload",
+        for _, key in ipairs({"espEnabled","silentAim","noSpread","noRecoil","infiniteAmmo","instantReload","noShootCooldown",
             "infiniteStamina","antiRagdoll","antiFallDamage","infiniteHorseStamina","alwaysDay",
             "gravityEnabled","hipHeightEnabled","speedEnabled","walkUnderWater","allowGunsUnderWater","highlightGoldBars",
             "graphicsNoShadows","graphicsReduceEffects","graphicsNoPostEffects","graphicsHideTextures","graphicsLowWater"}) do
@@ -4034,7 +4062,7 @@ local loaded = LoadStateFromConfig("Default")
 if loaded then state.currentConfig = "Default" end
 updateUIFromState()
 if HOOKS.install then HOOKS.install() end
-if (state.infiniteAmmo or state.instantReload) and AMMO.install then AMMO.install() end
+if (state.infiniteAmmo or state.instantReload or state.noShootCooldown) and AMMO.install then AMMO.install() end
 if FB.applyTime then FB.applyTime() end
 
 print("[TWW] Loaded. " .. #CFG.getFiles() .. " saved profile(s).")
