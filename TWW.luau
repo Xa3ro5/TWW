@@ -129,7 +129,7 @@ local GraphicsFactory = (function()
 return function(S, state, connect)
     local api={}
     local records=setmetatable({}, {__mode="k"})
-    local queue,head={},1
+    local queue,head,tail={},1,0
     local running,needsScan=false,false
     local function write(object,key,value)
         local properties=records[object]
@@ -165,9 +165,9 @@ return function(S, state, connect)
     local function enabled()
         return state.graphicsNoShadows or state.graphicsReduceEffects or state.graphicsNoPostEffects or state.graphicsHideTextures
     end
-    local function enqueue(object) queue[#queue+1]=object end
+    local function enqueue(object) tail+=1;queue[tail]=object end
     function api.sync()
-        table.clear(queue);head=1
+        table.clear(queue);head=1;tail=0
         running=enabled() or state.graphicsLowWater
         -- Restore affected objects immediately when a feature is disabled.
         for object in pairs(records) do apply(object) end
@@ -198,20 +198,20 @@ return function(S, state, connect)
             write(terrain,"WaterWaveSize",0);write(terrain,"WaterWaveSpeed",0);write(terrain,"WaterReflectance",0)
         end
         if needsScan then
-            needsScan=false;queue=S.Workspace:GetDescendants();head=1
+            needsScan=false;queue=S.Workspace:GetDescendants();head=1;tail=#queue
             for _,object in ipairs(S.Lighting:GetDescendants()) do enqueue(object) end
         end
         local started=os.clock();local n=0
-        while head<=#queue and n<256 do
-            local object=queue[head];head+=1;n+=1
+        while head<=tail and n<256 do
+            local object=queue[head];queue[head]=nil;head+=1;n+=1
             if object.Parent then apply(object) end
             if os.clock()-started>=0.0015 then break end
         end
-        if head>#queue then table.clear(queue);head=1 end
+        if head>tail then head=1;tail=0 end
     end)
     function api.stop()
         running=false;needsScan=false
-        table.clear(queue);head=1
+        table.clear(queue);head=1;tail=0
         for object,properties in pairs(records) do
             for key,record in pairs(properties) do
                 pcall(function() if object[key]==record.last then object[key]=record.original end end)
@@ -221,7 +221,7 @@ return function(S, state, connect)
     end
     function api.status()
         local n=0;for _ in pairs(records) do n+=1 end
-        return {changedObjects=n,queued=math.max(0,#queue-head+1)}
+        return {changedObjects=n,queued=math.max(0,tail-head+1)}
     end
     return api
 end
@@ -2090,8 +2090,8 @@ local function initChar()
     local ragdollProtection={installed=false,blocked=0,blockedFalls=0,recoveries=0}
     CHAR.ragdollProtection=ragdollProtection
     local PinnedHorse = nil
-    local pinnedStates={}
-    local staminaMethods={}
+    local pinnedStates=setmetatable({}, {__mode="k"})
+    local staminaMethods=setmetatable({}, {__mode="k"})
     local ready = false
     local ragdollGuard
     local nativeOwner, nativeMethods, nativeAttemptedOwner
@@ -2478,11 +2478,12 @@ local function initChar()
 
     task.spawn(function()
         local nextSync = 0
+        local lastSyncErrorLog = -math.huge
         while not state.destroyed do
             task.wait(0.25)
             if state.destroyed then return end
             if ready then
-                pcall(function()
+                local ok, err = pcall(function()
                     if os.clock() >= nextSync or Global.PlayerCharacter ~= PC then
                         nextSync = os.clock() + 2
                         if Global.PlayerCharacter ~= PC then refreshPC() end
@@ -2491,6 +2492,15 @@ local function initChar()
                     if state.infiniteStamina or state.antiRagdoll or state.antiFallDamage then hookFireServer() end
                     if state.antiRagdoll then applyAntiRagdoll();recoverRagdoll() end
                 end)
+                if not ok then
+                    CHAR.lastSyncError = tostring(err)
+                    if os.clock() - lastSyncErrorLog >= 10 then
+                        lastSyncErrorLog = os.clock()
+                        warn("[TWW] Character sync error: " .. CHAR.lastSyncError)
+                    end
+                else
+                    CHAR.lastSyncError = nil
+                end
             end
         end
     end)
@@ -3965,7 +3975,7 @@ local function initMain()
         for _,connection in ipairs(ownedConnections) do if connection.Connected then connections+=1 end end
         return {active=state.active,destroyed=state.destroyed,features=features,objects=objects,
             objectsByType=objectsByType,event=Adapter.snapshot and Adapter.snapshot() or {},profile=state.currentConfig,
-            initErrors=initErrors,legacy=legacyReport,graphics=Graphics.status and Graphics.status(),ammo=AMMO.diagnostics,fallProtection=CHAR.fallProtection,ragdollProtection=CHAR.ragdollProtection,prediction=COMBAT.prediction,connections=connections,esp=ESP.diagnostics}
+            initErrors=initErrors,characterSyncError=CHAR.lastSyncError,legacy=legacyReport,graphics=Graphics.status and Graphics.status(),ammo=AMMO.diagnostics,fallProtection=CHAR.fallProtection,ragdollProtection=CHAR.ragdollProtection,prediction=COMBAT.prediction,connections=connections,esp=ESP.diagnostics}
     end
     function controller:Configure(preferences)
         assert(not state.destroyed and type(preferences)=="table","Expected settings table")
@@ -4009,14 +4019,23 @@ local function initMain()
         end)
     end
     connect(S.LocalPlayer.CharacterAdded, refreshCharacter)
+    local playerConnections = {}
     local function watchPlayer(player)
         if player ~= S.LocalPlayer then
-            connect(player.CharacterAdded, function()
+            playerConnections[player] = connect(player.CharacterAdded, function()
                 if ESP.refresh then ESP.refresh() end
             end)
         end
     end
     connect(S.Players.PlayerAdded, watchPlayer)
+    connect(S.Players.PlayerRemoving, function(player)
+        local connection = playerConnections[player]
+        if not connection then return end
+        connection:Disconnect()
+        playerConnections[player] = nil
+        local index = table.find(ownedConnections, connection)
+        if index then table.remove(ownedConnections, index) end
+    end)
     for _, player in ipairs(S.Players:GetPlayers()) do watchPlayer(player) end
 end
 
