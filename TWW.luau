@@ -378,9 +378,9 @@ local state = {
     highlightGoldBars=false,
     alwaysDay=false,
     playerColor="Green", npcColor="Purple", animalColor="White", horseColor="Cyan",
-    oreColor="Orange", itemColor="Cyan", chestColor="Magenta", trainColor="Red",
+    oreColor="Auto", itemColor="Cyan", chestColor="Magenta", trainColor="Red",
     territoryColor="Purple", fishColor="Blue", deadAnimalColor="Red",
-    legendaryColor="Yellow", tracerColor="Cyan", thunderstruckColor="Yellow",
+    legendaryColor="Gold", tracerColor="Cyan", thunderstruckColor="Yellow",
     tracerThickness=1, tracerTransparency=0.15, labelSize=13,
     updateInterval=0.1, espRenderDistance=3000,
     graphicsNoShadows=false, graphicsReduceEffects=false, graphicsNoPostEffects=false,
@@ -479,6 +479,9 @@ local function initDrawing() Drawing=OverlayFactory(S,own,Drawing) end
 
 -- ====== SAVE/LOAD ======
 local _loadingConfig = false
+local activeProfile = "Default"
+local savedSnapshot
+local saveError
 local function updateUIFromState()
     local wasLoading = _loadingConfig
     _loadingConfig = true
@@ -527,7 +530,7 @@ local function savedValue(key, value)
         return out
     elseif type(value) == "string" then
         if #value > 100 then return nil end
-        if key:match("Color$") and not COLOR_PRESETS[value] then return nil end
+        if key:match("Color$") and not COLOR_PRESETS[value] and not (key == "oreColor" and value == "Auto") then return nil end
         if key == "currentConfig" and not validProfileName(value) then return nil end
         if key == "targetPart" and not table.find({"Head","UpperTorso","LowerTorso","Random","Closest"}, value) then return nil end
     end
@@ -538,7 +541,54 @@ local function SaveStateToConfig(name)
     if not CFG.ready or not CFG.save or not validProfileName(name) then return false end
     local data = {}
     for key in pairs(DEFAULT_STATE) do data[key] = state[key] end
+    data.currentConfig = name
     return CFG.save(name, data)
+end
+
+-- Compare copies so in-place checklist changes are observed as well.
+local function configSnapshot()
+    local snapshot = {}
+    for key in pairs(DEFAULT_STATE) do
+        if key ~= "currentConfig" then
+            local value = state[key]
+            if type(value) == "table" then
+                local copy = {}
+                for i, item in ipairs(value) do copy[i] = item end
+                value = copy
+            end
+            snapshot[key] = value
+        end
+    end
+    return snapshot
+end
+local function configChanged(a, b)
+    if not a or not b then return true end
+    for key, value in pairs(a) do
+        local previous = b[key]
+        if type(value) == "table" and type(previous) == "table" then
+            if #value ~= #previous then return true end
+            for i, item in ipairs(value) do if previous[i] ~= item then return true end end
+        elseif value ~= previous then return true end
+    end
+    return false
+end
+local function flushConfig()
+    if _loadingConfig or not CFG.ready then return false end
+    local snapshot = configSnapshot()
+    if not configChanged(snapshot, savedSnapshot) then return true end
+    if SaveStateToConfig(activeProfile) then
+        savedSnapshot = snapshot
+        saveError = nil
+        return true
+    end
+    if not saveError then originalWarn("[TWW] Automatic profile save failed: " .. activeProfile) end
+    saveError = "Automatic profile save failed: " .. activeProfile
+    return false
+end
+local function activateProfile(name)
+    activeProfile = name
+    savedSnapshot = configSnapshot()
+    if CFG.setActive then CFG.setActive(name) end
 end
 
 local function LoadStateFromConfig(name)
@@ -546,6 +596,10 @@ local function LoadStateFromConfig(name)
     local data = CFG.load(name)
     if type(data) ~= "table" then return false end
     if stopAll then stopAll() end
+    -- A partial or older profile starts from defaults, not the previous profile.
+    for key, value in pairs(DEFAULT_STATE) do
+        state[key] = type(value) == "table" and table.clone(value) or value
+    end
     for key, value in pairs(data) do
         local checked = savedValue(key, value)
         if checked ~= nil then state[key] = checked end
@@ -623,6 +677,15 @@ local function initCFG()
     CFG.delete = function(name)
         if not ready or not canDel or not validProfileName(name) then return false end
         return pcall(function() delfile(FOLDER .. name .. ".json") end)
+    end
+    CFG.getActive = function()
+        if not ready then return nil end
+        local ok, name = pcall(readfile, FOLDER .. ".active")
+        return ok and validProfileName(name) and name or nil
+    end
+    CFG.setActive = function(name)
+        if not ready or not validProfileName(name) then return false end
+        return pcall(writefile, FOLDER .. ".active", name)
     end
 end
 
@@ -840,31 +903,36 @@ local function initWater()
         state.walkUnderWater = enabled
         if enabled then startWW() else stopWW() end
     end
-    local origCanSwitch = nil
+    local origCanSwitch, canSwitchHook
+    local function removeGunsUW()
+        if gunOwner and canSwitchHook and gunOwner.CanSwitchToItem == canSwitchHook then
+            pcall(function() gunOwner.CanSwitchToItem = origCanSwitch end)
+        end
+        origCanSwitch, canSwitchHook, gunOwner = nil, nil, nil
+    end
     local function applyGunsUW()
         if not Global or not Global.PlayerCharacter then return end
         local pc = Global.PlayerCharacter
-        if gunOwner == pc and origCanSwitch then return end
-        if gunOwner and origCanSwitch then gunOwner.CanSwitchToItem = origCanSwitch end
+        if gunOwner == pc and canSwitchHook and pc.CanSwitchToItem == canSwitchHook then return end
+        removeGunsUW()
         gunOwner = pc
         origCanSwitch = pc.CanSwitchToItem
         if type(origCanSwitch) ~= "function" then return end
-        pc.CanSwitchToItem = function(self, itemData, silent, ...)
+        local forward = origCanSwitch
+        canSwitchHook = function(self, itemData, silent, ...)
             local prevSwim = self.Swimming
-            if state.allowGunsUnderWater then
+            local changed = state.allowGunsUnderWater
+            if changed then
                 pcall(function() self.Swimming = false end)
             end
-            local ok, a, b = pcall(origCanSwitch, self, itemData, silent, ...)
-            if state.allowGunsUnderWater then
+            local values = table.pack(pcall(forward, self, itemData, silent, ...))
+            if changed then
                 pcall(function() self.Swimming = prevSwim end)
             end
-            if ok then return a, b else return origCanSwitch(self, itemData, silent, ...) end
+            if not values[1] then error(values[2], 0) end
+            return table.unpack(values, 2, values.n)
         end
-    end
-    local function removeGunsUW()
-        if gunOwner and origCanSwitch then pcall(function() gunOwner.CanSwitchToItem = origCanSwitch end) end
-        origCanSwitch = nil
-        gunOwner = nil
+        pc.CanSwitchToItem = canSwitchHook
     end
     Water.setAllowGunsUnderWater = function(enabled)
         state.allowGunsUnderWater = enabled
@@ -1488,7 +1556,7 @@ local function initESP()
         end
 
         local isLegendaryMode = isLegendary and (entityType == "animal" or entityType == "horse")
-        local fillColor = isLegendaryMode and Color3.fromRGB(255,215,0) or Color3.fromRGB(255,0,0)
+        local fillColor = color
         local outlineColor = isLegendaryMode and Color3.fromRGB(255,255,180) or Color3.fromRGB(255,255,255)
 
         local wanted = {}
@@ -1687,7 +1755,7 @@ local function initESP()
                     for _, n in ipairs(animalFilterList) do filterSet[n] = true end
                 end
                 for _, animal in pairs(af:GetChildren()) do
-                    if animal:IsA("Model") then
+                    if animal:IsA("Model") and isAlive(animal) then
                         local isH = isHorse(animal)
                         local isLeg = (not isH) and isLegendaryAnimal(animal)
                         local skip = false
@@ -1707,7 +1775,7 @@ local function initESP()
                                     esp.entityType = isH and "horse" or "animal"
                                     local c
                                     if isH then c = COLOR_PRESETS[state.horseColor] or Color3.fromRGB(0,255,255)
-                                    elseif isLeg then c = Color3.fromRGB(255,215,0)
+                                    elseif isLeg and state.legendaryGoldenMode then c = COLOR_PRESETS[state.legendaryColor] or COLOR_PRESETS.Gold
                                     else c = COLOR_PRESETS[state.animalColor] or Color3.fromRGB(255,255,255) end
                                     renderEntityESP(esp, p, {color=c, heightOffset=2, showHealthData=true,
                                         character=animal, name=animal.Name, distance=d,
@@ -1735,7 +1803,7 @@ local function initESP()
                     if oreF:IsA("Folder") then
                         local typeName = oreF.Name
                         local tier = getPickaxeTier(typeName)
-                        local baseC = getOreColor(typeName)
+                        local baseC = COLOR_PRESETS[state.oreColor] or getOreColor(typeName)
                         for _, oreM in pairs(oreF:GetChildren()) do
                             if oreM:IsA("Model") then
                                 local p = getTargetPart(oreM)
@@ -1766,7 +1834,7 @@ local function initESP()
                                             esp.label.Text = table.concat(tp, " | ")
                                             esp.label.Color = baseC
                                             esp.label.Position = Vector2.new(sp.X, sp.Y - 30)
-                                            esp.label.Visible = true
+                                            esp.label.Visible = #tp > 0
                                         else
                                             esp.label.Visible = false
                                         end
@@ -1811,7 +1879,7 @@ local function initESP()
                                 esp.label.Text = table.concat(tp, " | ")
                                 esp.label.Color = c
                                 esp.label.Position = Vector2.new(sp.X, sp.Y - 30)
-                                esp.label.Visible = true
+                                esp.label.Visible = #tp > 0
                             else
                                 esp.label.Visible = false
                             end
@@ -3332,7 +3400,6 @@ local function initUI()
         ConfigAutoSave = false,
         OnClose = function()
             if not state.destroyed then
-                SaveStateToConfig(state.currentConfig)
                 if destroyRuntime then destroyRuntime() end
             end
         end,
@@ -3469,7 +3536,7 @@ local function initUI()
 
 
     local bodySec = VisualsTab:Section("✨ Body Highlights")
-    bodySec:Label("Choose the body groups to emphasize. Legendary animals keep their gold highlight.")
+    bodySec:Label("Choose the body groups to emphasize.")
     uiHandles.checkboxes.chamsEnabled = bodySec:Checkbox("✨ Enable Body Highlights", function(e)
         if _loadingConfig then return end
         state.chamsEnabled = e
@@ -3558,7 +3625,12 @@ local function initUI()
 
     local colorSec = VisualsTab:Section("🎨 Category Colors")
     local function colorDD(label, key)
-        uiHandles.dropdowns[key] = colorSec:Dropdown(label, COLOR_OPTIONS, function(v)
+        local options = COLOR_OPTIONS
+        if key == "oreColor" then
+            options = {"Auto"}
+            for _, color in ipairs(COLOR_OPTIONS) do table.insert(options, color) end
+        end
+        uiHandles.dropdowns[key] = colorSec:Dropdown(label, options, function(v)
             if _loadingConfig then return end
             state[key] = v
         end, state[key])
@@ -3633,15 +3705,13 @@ local function initUI()
     ctToggle("👤 Target Players", "targetPlayers")
     ctToggle("🐎 Target Animals & Horses", "targetAnimals")
     ctToggle("🤖 Target NPCs & Bosses", "targetNPCs")
-    tgtSec:Label("Horses and bosses are included. Your ridden mount is always excluded.")
-    tgtSec:Label("Visual filters do not restrict combat targets.")
 
     local aimingSec = CombatTab:Section("📐 Aim & Visibility")
-    uiHandles.sliders.fov = aimingSec:Slider("📐 Aim Cone (degrees)", 1, 180, state.fov, function(v)
+    uiHandles.sliders.fov = aimingSec:Slider("📐 Aim Cone (degrees)", 5, 180, state.fov, function(v)
         if _loadingConfig then return end
         state.fov = v
         ESP.updateFOV()
-    end, 1)
+    end, 5)
     uiHandles.checkboxes.visibilityCheck = aimingSec:Checkbox("🧱 Require Line of Sight", function(e)
         if _loadingConfig then return end
         state.visibilityCheck = e
@@ -3702,7 +3772,6 @@ local function initUI()
         if e and not AMMO.install() then state.instantReload=false;updateUIFromState();toast("Reload hooks unavailable. Check Diagnostics.",3)
         elseif not e and not state.infiniteAmmo and not state.noShootCooldown then AMMO.uninstall() end
     end, state.instantReload)
-    ammoSec:Label("Wand: bypasses local mana checks. Server validation still applies.")
 
     -- ================== UTILITIES ==================
     local charSec = UtilitiesTab:Section("🛡️ Stamina & Protection")
@@ -3735,14 +3804,12 @@ local function initUI()
         else CHAR.removeAntiRagdoll() end
         CHAR.sync()
     end, state.antiRagdoll)
-    charSec:Label("Blocks local falls and knockback. Server ragdolls use native recovery.")
     uiHandles.checkboxes.antiFallDamage = charSec:Checkbox("🪂 Prevent Fall Damage", function(e)
         if _loadingConfig then return end
         state.antiFallDamage = e
         if e then CHAR.applyAntiFallDamage() else CHAR.removeAntiFallDamage() end
         CHAR.sync()
     end, state.antiFallDamage)
-    charSec:Label("Fall protection includes ragdoll landing impacts.")
     local waterSec = UtilitiesTab:Section("🌊 Water")
     uiHandles.checkboxes.walkUnderWater = waterSec:Checkbox("🚶 Walk Underwater", function(e)
         if _loadingConfig then return end
@@ -3817,13 +3884,16 @@ local function initUI()
     profSec:Button("💾 Save Profile", function()
         local name = state.currentConfig
         if name == "" or name == "(no saved profiles)" then toast("Enter a valid profile name first.", 3); return end
-        if SaveStateToConfig(name) then refreshConfigDropdown(); toast("Saved as \""..name.."\"", 2)
+        if name ~= activeProfile and not flushConfig() and CFG.ready then toast("Could not save the active profile.", 3); return end
+        if SaveStateToConfig(name) then activateProfile(name); refreshConfigDropdown(); toast("Saved as \""..name.."\"", 2)
         else toast("Save failed. Check console.", 3) end
     end)
     profSec:Button("📂 Load Profile", function()
         local name = state.currentConfig
         if name == "" or name == "(no saved profiles)" then toast("Select a profile first.", 3); return end
+        if not flushConfig() and CFG.ready then toast("Could not save the active profile.", 3); return end
         if LoadStateFromConfig(name) then
+            activateProfile(name)
             updateUIFromState(); ESP.updateFOV()
             if uiHandles.checklists.animalFilter then
                 pcall(function() uiHandles.checklists.animalFilter:SetSelected(state.animalFilter or {}) end)
@@ -3835,19 +3905,23 @@ local function initUI()
         local name = state.currentConfig
         if name == "" or name == "(no saved profiles)" then toast("Select a profile to delete.", 3); return end
         if not CFG.delete(name) then toast("Delete failed.", 3); return end
-        state.currentConfig = "Default"
+        if name == activeProfile then
+            if name == "Default" or not LoadStateFromConfig("Default") then ResetStateToDefault() end
+            activateProfile("Default")
+        end
+        state.currentConfig = activeProfile
         if uiHandles.textboxes.configName then
-            pcall(function() uiHandles.textboxes.configName:Set("Default") end)
+            pcall(function() uiHandles.textboxes.configName:Set(activeProfile) end)
         end
         refreshConfigDropdown()
         toast("Deleted \""..name.."\"", 2)
     end)
     profSec:Button("🔄 Refresh Profiles", function() refreshConfigDropdown() end)
     profSec:Button("♻️ Restore Default Settings", function()
-        ResetStateToDefault(); ESP.updateFOV()
+        ResetStateToDefault(); state.currentConfig = activeProfile; updateUIFromState(); ESP.updateFOV()
         toast("All settings reset.", 2)
     end)
-    profSec:Label(CFG.ready and "Preferences save on close. Active effects always load OFF." or "Profile storage is unavailable in this executor.")
+    profSec:Label(CFG.ready and "Changes save automatically to the active profile. Active effects load OFF." or "Profile storage is unavailable in this executor.")
 
     local sysSec = ConfigTab:Section("🚪 Session & Cleanup")
     sysSec:Button("🛑 Stop All Features", function()
@@ -3939,6 +4013,7 @@ local function initMain()
     end
     destroyRuntime = function()
         if state.destroyed then return end
+        flushConfig()
         stopAll()
         state.destroyed = true
         state.active = false
@@ -3977,7 +4052,7 @@ local function initMain()
         local connections=0
         for _,connection in ipairs(ownedConnections) do if connection.Connected then connections+=1 end end
         return {active=state.active,destroyed=state.destroyed,features=features,objects=objects,
-            objectsByType=objectsByType,event=Adapter.snapshot and Adapter.snapshot() or {},profile=state.currentConfig,
+            objectsByType=objectsByType,event=Adapter.snapshot and Adapter.snapshot() or {},profile=activeProfile,profileSaveError=saveError,
             initErrors=initErrors,characterSyncError=CHAR.lastSyncError,legacy=legacyReport,graphics=Graphics.status and Graphics.status(),ammo=AMMO.diagnostics,fallProtection=CHAR.fallProtection,ragdollProtection=CHAR.ragdollProtection,prediction=COMBAT.prediction,connections=connections,esp=ESP.diagnostics}
     end
     function controller:Configure(preferences)
@@ -3987,11 +4062,14 @@ local function initMain()
                 local checked=savedValue(key,value);if checked~=nil then state[key]=checked end
             end
         end
-        ESP.lastUpdate=0;updateUIFromState()
+        ESP.lastUpdate=0
+        if ESP.setLabelSize then ESP.setLabelSize(state.labelSize) end
+        updateUIFromState()
     end
     function controller:LoadProfile(name)
+        if not flushConfig() and CFG.ready then return false end
         local loaded = LoadStateFromConfig(name)
-        if loaded then updateUIFromState() end
+        if loaded then activateProfile(name); updateUIFromState() end
         return loaded
     end
     environment.TWWESP = controller
@@ -4002,8 +4080,11 @@ local function initMain()
         if ESP.updateFOV then ESP.updateFOV() end
     end)
     local espWasActive=false
-    connect(S.RunService.Heartbeat,function()
+    local configTimer=0
+    connect(S.RunService.Heartbeat,function(dt)
         if not state.active then return end
+        configTimer += dt
+        if configTimer >= 0.25 then configTimer = 0; flushConfig() end
         if state.silentAim and COMBAT.sample then COMBAT.sample() end
         if state.espEnabled or state.highlightGoldBars or espWasActive then
             if ESP.update then ESP.update() end
@@ -4080,10 +4161,12 @@ if not uiReady or not state.window then
 end
 safeInit("Main", initMain)
 
-local loaded = LoadStateFromConfig("Default")
-if loaded then state.currentConfig = "Default" end
+local profile = (CFG.getActive and CFG.getActive()) or "Default"
+local loaded = LoadStateFromConfig(profile)
+if not loaded and profile ~= "Default" then profile = "Default"; loaded = LoadStateFromConfig(profile) end
+state.currentConfig = profile
+activateProfile(profile)
 updateUIFromState()
-if HOOKS.install then HOOKS.install() end
 if (state.infiniteAmmo or state.instantReload or state.noShootCooldown) and AMMO.install then AMMO.install() end
 if FB.applyTime then FB.applyTime() end
 
