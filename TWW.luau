@@ -3707,11 +3707,11 @@ local function initUI()
     ctToggle("🤖 Target NPCs & Bosses", "targetNPCs")
 
     local aimingSec = CombatTab:Section("📐 Aim & Visibility")
-    uiHandles.sliders.fov = aimingSec:Slider("📐 Aim Cone (degrees)", 5, 180, state.fov, function(v)
+    uiHandles.sliders.fov = aimingSec:Slider("📐 Aim Cone (degrees)", 1, 180, state.fov, function(v)
         if _loadingConfig then return end
         state.fov = v
         ESP.updateFOV()
-    end, 5)
+    end, 1)
     uiHandles.checkboxes.visibilityCheck = aimingSec:Checkbox("🧱 Require Line of Sight", function(e)
         if _loadingConfig then return end
         state.visibilityCheck = e
