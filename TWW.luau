@@ -1249,12 +1249,15 @@ local function initESP()
         return false
     end
 
-    local ORE_TIER = {Coal="Tier 1",Copper="Tier 1",Zinc="Tier 2",Iron="Tier 3",Limestone="Tier 3",Silver="Tier 4",Gold="Tier 5",Quartz="Tier 3",Diamond="Tier 6",Emerald="Tier 6",Ruby="Tier 6",Sapphire="Tier 6",Uranium="Tier 7",["Frozen Quartz"]="Tier 6",["Mythril"]="Tier 6",["Tungsten"]="Tier 5",["Topaz"]="Tier 4"}
+    -- Fallback for the main place's OreDepositInfo, observed on 2026-11-16.
+    local ORE_TIER = {Coal=1, Copper=1, Zinc=2, Iron=3, Limestone=3, Silver=4, Gold=5, Quartz=6,
+        CoalVein=7, CopperVein=7, ZincVein=7, IronVein=8, SilverVein=8, GoldVein=9}
     local function getPickaxeTier(n)
-        local t = ORE_TIER[n]
-        if t then return t end
-        for ore, ti in pairs(ORE_TIER) do if n:lower():find(ore:lower()) then return ti end end
-        return "Tier ?"
+        local info = Global and Global.SharedData and Global.SharedData.OreDepositInfo
+        local entry = type(info) == "table" and info[n]
+        local tier = type(entry) == "table" and entry.NeedsTier
+        if type(tier) ~= "number" or tier < 1 or tier ~= tier or tier == math.huge then tier = ORE_TIER[n] end
+        return tier and ("Tier " .. tostring(tier)) or "Tier ?"
     end
     local function getOreColor(oreName)
         local n = oreName:lower()
@@ -3634,11 +3637,11 @@ local function initUI()
     tgtSec:Label("Visual filters do not restrict combat targets.")
 
     local aimingSec = CombatTab:Section("📐 Aim & Visibility")
-    uiHandles.sliders.fov = aimingSec:Slider("📐 Aim Cone (degrees)", 5, 180, state.fov, function(v)
+    uiHandles.sliders.fov = aimingSec:Slider("📐 Aim Cone (degrees)", 1, 180, state.fov, function(v)
         if _loadingConfig then return end
         state.fov = v
         ESP.updateFOV()
-    end, 5)
+    end, 1)
     uiHandles.checkboxes.visibilityCheck = aimingSec:Checkbox("🧱 Require Line of Sight", function(e)
         if _loadingConfig then return end
         state.visibilityCheck = e
