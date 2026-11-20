@@ -1,4 +1,4 @@
--- TWW | SmugLibV2 | 2026-11-10
+-- TWW | SmugLibV2 | 2026-11-19 | projectile accuracy compatibility
 -- Edit src/TWW.luau, then run tools/build.py. UI and licensing belong to shared SmugLibV2.
 if game.PlaceId ~= 2317712696 then
     warn("[TWW] This script supports The Wild West main place only.")
@@ -2837,48 +2837,63 @@ local function initHooks()
         end
     end
 
+    -- The game's native accuracy is tied to weapon/ammo/stance and may be verified by the server.
+    -- Never replace params.accuracy or SharedData.*Accuracy with a hardcoded number.
+    -- Only change the projectile direction for Silent Aim, leaving native spread intact.
+    -- Explicit per-shot spread fields can still be reduced when the game supplies them.
+    HOOKS.diagnostics = {redirectedShots=0,spreadOverrides=0,spreadUnavailable=0,lastProjectileType=nil}
+    local function finiteVector3(value)
+        return typeof(value)=="Vector3"
+            and value.X==value.X and value.Y==value.Y and value.Z==value.Z
+            and math.abs(value.X)<math.huge and math.abs(value.Y)<math.huge and math.abs(value.Z)<math.huge
+    end
+
     local function initProjectilesHook(self, projType, sharedData, params, callback)
-        if not installed or state.destroyed then return oldInitProjectiles(self,projType,sharedData,params,callback) end
-        if type(params) == "table"
-            and typeof(params.origin) == "Vector3"
-            and typeof(params.direction) == "Vector3" then
-            params=table.clone(params)
-            local redirected = false
-            if state.silentAim then
-                local okT, target = pcall(COMBAT.getBestTarget, params.origin)
-                if okT and target then
-                    local aimPos = target.part.Position
+        if not installed or state.destroyed or not (state.silentAim or state.noSpread) then
+            return oldInitProjectiles(self,projType,sharedData,params,callback)
+        end
+        if type(params) ~= "table" or not finiteVector3(params.origin) or not finiteVector3(params.direction) then
+            return oldInitProjectiles(self,projType,sharedData,params,callback)
+        end
 
-                    local canRedirect=true
-                    if COMBAT.predictAim then
-                        local speed,gravity
-                        if type(ProjectileHandler.GetProjectilePowerAndAccuracy)=="function" then
-                            local ok,value=pcall(ProjectileHandler.GetProjectilePowerAndAccuracy,ProjectileHandler,projType,sharedData,params)
-                            if ok then speed=value end
-                        end
-                        if type(ProjectileHandler.GetProjectileGravity)=="function" then
-                            local ok,value=pcall(ProjectileHandler.GetProjectileGravity,ProjectileHandler,projType,sharedData)
-                            if ok and typeof(value)=="Vector3" then gravity=-value.Y end
-                        end
-                        if type(speed)=="number" and type(gravity)=="number" then
-                            local velocity=COMBAT.getTargetVelocity(target) or Vector3.new(0,0,0)
-                            local platform=projType=="TomahawkProjectile" and typeof(params.platformVelocity)=="Vector3" and params.platformVelocity or nil
-                            local predicted = COMBAT.predictAim(params.origin, aimPos, velocity, speed, gravity,platform)
-                            if predicted then aimPos=predicted else canRedirect=false end
-                        else canRedirect=false end
+        -- Clone on the first actual edit, not for every shot. No recoil never enters this hook.
+        local shotParams = params
+        local function writable()
+            if shotParams == params then shotParams=table.clone(params) end
+            return shotParams
+        end
+
+        if state.silentAim then
+            local okT, target = pcall(COMBAT.getBestTarget, params.origin)
+            if okT and target and target.part then
+                local aimPos = target.part.Position
+                local canRedirect = finiteVector3(aimPos)
+                if canRedirect and type(COMBAT.predictAim)=="function" then
+                    local speed,gravity
+                    if type(ProjectileHandler.GetProjectilePowerAndAccuracy)=="function" then
+                        local ok,value=pcall(ProjectileHandler.GetProjectilePowerAndAccuracy,ProjectileHandler,projType,sharedData,params)
+                        if ok then speed=value end
                     end
-
-                    local delta = aimPos - params.origin
-                    if canRedirect and delta.Magnitude > 0.01 then
-                        params.direction = delta.Unit
-                        -- Native spread is applied after this hook. A selected aim point must survive it.
-                        params.accuracy=1
-                        if type(sharedData)=="table" then
-                            sharedData=table.clone(sharedData)
-                            sharedData.ProjectileAccuracy=if params.ammoType=="CoinShot" then 1.25 else 1
-                            sharedData.ShotgunRoundAccuracy=1;sharedData.SlugRoundAccuracy=1
-                        end
-                        redirected = true
+                    if type(ProjectileHandler.GetProjectileGravity)=="function" then
+                        local ok,value=pcall(ProjectileHandler.GetProjectileGravity,ProjectileHandler,projType,sharedData)
+                        if ok and finiteVector3(value) then gravity=-value.Y end
+                    end
+                    if type(speed)=="number" and speed>0 and speed<math.huge
+                        and type(gravity)=="number" and gravity==gravity and math.abs(gravity)<math.huge then
+                        local velocity=COMBAT.getTargetVelocity(target) or Vector3.new(0,0,0)
+                        local platform=projType=="TomahawkProjectile" and finiteVector3(params.platformVelocity) and params.platformVelocity or nil
+                        local predicted=COMBAT.predictAim(params.origin,aimPos,velocity,speed,gravity,platform)
+                        if finiteVector3(predicted) then aimPos=predicted else canRedirect=false end
+                    else
+                        canRedirect=false
+                    end
+                end
+                if canRedirect then
+                    local delta=aimPos-params.origin
+                    if finiteVector3(delta) and delta.Magnitude>0.01 then
+                        writable().direction=delta.Unit
+                        HOOKS.diagnostics.redirectedShots+=1
+                        HOOKS.diagnostics.lastProjectileType=tostring(projType)
                         if state.debugPrints and os.clock()-lastCombatLog>=1 then
                             lastCombatLog=os.clock()
                             print(string.format("[TWW] %s -> %s (%s) | %.1f° | %d studs | pred %.2fx",
@@ -2889,30 +2904,28 @@ local function initHooks()
                     end
                 end
             end
-            if state.noSpread then
-                if type(sharedData) == "table" then sharedData = table.clone(sharedData) end
-                params.accuracy = 1
-                if typeof(params.spread) == "number" then params.spread = 0 end
-                if typeof(params.Spread) == "number" then params.Spread = 0 end
-                if typeof(params.spreadAngle) == "number" then params.spreadAngle = 0 end
-                if typeof(params.SpreadAngle) == "number" then params.SpreadAngle = 0 end
-                if type(sharedData) == "table" then
-                    if type(sharedData.ProjectileAccuracy) == "number" then
-                        sharedData.ProjectileAccuracy = 1
-                    end
-                    if type(sharedData.ShotgunRoundAccuracy) == "number" then
-                        sharedData.ShotgunRoundAccuracy = 1
-                    end
-                    if type(sharedData.SlugRoundAccuracy) == "number" then
-                        sharedData.SlugRoundAccuracy = 1
-                    end
-                    if type(sharedData.CoinShotAccuracy) == "number" then
-                        sharedData.CoinShotAccuracy = 1
-                    end
+        end
+
+        if state.noSpread then
+            -- Preserve the native accuracy values used in projectile validation.
+            -- These optional fields have an effect only on projectile types that consume them.
+            local changed=false
+            for _,key in ipairs({"spread","Spread","spreadAngle","SpreadAngle"}) do
+                local value=params[key]
+                if type(value)=="number" and value==value and value>0 and value<math.huge then
+                    writable()[key]=0
+                    changed=true
                 end
             end
+            if changed then
+                HOOKS.diagnostics.spreadOverrides+=1
+            else
+                -- Do not fake No Spread by transmitting an invalid accuracy value.
+                HOOKS.diagnostics.spreadUnavailable+=1
+            end
         end
-        return oldInitProjectiles(self, projType, sharedData, params, callback)
+
+        return oldInitProjectiles(self,projType,sharedData,shotParams,callback)
     end
 
     local wandClass, oldWandCast
@@ -2995,7 +3008,6 @@ local function initHooks()
             ProjectileHandler.InitProjectiles = initProjectilesHook
         end
         installWandAim()
-        HOOKS.applyNoRecoil(state.noRecoil)
     end
     HOOKS.uninstall = function()
         if not installed then return end
@@ -3004,8 +3016,13 @@ local function initHooks()
         if ProjectileHandler and ProjectileHandler.InitProjectiles==initProjectilesHook then
             ProjectileHandler.InitProjectiles = oldInitProjectiles
         end
-        HOOKS.applyNoRecoil(false)
+        -- Camera recoil is independent: disabling Silent Aim must not re-enable recoil.
     end
+    HOOKS.sync = function()
+        if state.silentAim or state.noSpread then HOOKS.install() else HOOKS.uninstall() end
+        HOOKS.applyNoRecoil(state.noRecoil)
+    end
+
 end
 
 -- =================================================================
@@ -3676,14 +3693,14 @@ local function initUI()
     local silentAimBox = aimCombatSec:Checkbox("🎯 Enable Silent Aim", function(e)
         if _loadingConfig then return end
         state.silentAim = e
-        if e and HOOKS.install then HOOKS.install() end
+        if HOOKS.sync then HOOKS.sync() end
         ESP.updateFOV()
     end, state.silentAim)
     uiHandles.checkboxes.silentAim = silentAimBox
     pcall(function()
         aimCombatSec:Bind("⌨️ Silent Aim Key", Enum.KeyCode.J, function()
             state.silentAim = not state.silentAim
-            if state.silentAim and HOOKS.install then HOOKS.install() end
+            if HOOKS.sync then HOOKS.sync() end
             pcall(function() silentAimBox:Set(state.silentAim) end)
             ESP.updateFOV()
             toast("Silent Aim "..(state.silentAim and "ON" or "OFF"), 2)
@@ -3743,14 +3760,15 @@ local function initUI()
     uiHandles.checkboxes.noRecoil = gunSec:Checkbox("🎯 No Recoil", function(e)
         if _loadingConfig then return end
         state.noRecoil = e
-        if e and HOOKS.install then HOOKS.install() end
+        -- Recoil affects the camera only; do not hook projectile accuracy for it.
         HOOKS.applyNoRecoil(e)
     end, state.noRecoil)
     uiHandles.checkboxes.noSpread = gunSec:Checkbox("✨ No Spread", function(e)
         if _loadingConfig then return end
         state.noSpread = e
-        if e and HOOKS.install then HOOKS.install() end
+        if HOOKS.sync then HOOKS.sync() end
     end, state.noSpread)
+    gunSec:Label("Compatibility mode: native projectile accuracy is preserved. No Spread can be limited for some weapons.")
 
     uiHandles.checkboxes.noShootCooldown = gunSec:Checkbox("⚡ No Shoot Cooldown", function(e)
         if _loadingConfig then return end
@@ -4001,6 +4019,7 @@ local function initMain()
         restore(CHAR.removeHorseStamina)
         restore(CHAR.unhookFireServer)
         restore(HOOKS.uninstall)
+        restore(function() if HOOKS.applyNoRecoil then HOOKS.applyNoRecoil(false) end end)
         restore(AMMO.uninstall)
         restore(Graphics.stop)
         restore(FB.stop)
@@ -4053,7 +4072,7 @@ local function initMain()
         for _,connection in ipairs(ownedConnections) do if connection.Connected then connections+=1 end end
         return {active=state.active,destroyed=state.destroyed,features=features,objects=objects,
             objectsByType=objectsByType,event=Adapter.snapshot and Adapter.snapshot() or {},profile=activeProfile,profileSaveError=saveError,
-            initErrors=initErrors,characterSyncError=CHAR.lastSyncError,legacy=legacyReport,graphics=Graphics.status and Graphics.status(),ammo=AMMO.diagnostics,fallProtection=CHAR.fallProtection,ragdollProtection=CHAR.ragdollProtection,prediction=COMBAT.prediction,connections=connections,esp=ESP.diagnostics}
+            initErrors=initErrors,characterSyncError=CHAR.lastSyncError,legacy=legacyReport,graphics=Graphics.status and Graphics.status(),ammo=AMMO.diagnostics,fallProtection=CHAR.fallProtection,ragdollProtection=CHAR.ragdollProtection,prediction=COMBAT.prediction,projectiles=HOOKS.diagnostics,connections=connections,esp=ESP.diagnostics}
     end
     function controller:Configure(preferences)
         assert(not state.destroyed and type(preferences)=="table","Expected settings table")
